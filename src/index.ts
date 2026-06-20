@@ -4,11 +4,14 @@ import { z } from "zod";
 
 const KALSHI_BASE = "https://api.elections.kalshi.com/trade-api/v2";
 
+// NBA and MLB bundle moneyline/spread/total/props into one event.
 const SPORT_TICKERS: Record<string, string> = {
-  worldcup: "KXWCGAME",
   mlb: "KXMLBGAME",
   nba: "KXNBAGAME",
 };
+
+// World Cup splits moneyline/spread/total into THREE separate series.
+const WORLDCUP_TICKERS = ["KXWCGAME", "KXWCSPREAD", "KXWCTOTAL"];
 
 async function kalshiFetch(path: string) {
   const res = await fetch(`${KALSHI_BASE}${path}`, {
@@ -23,15 +26,34 @@ async function kalshiFetch(path: string) {
 export class MyMCP extends McpAgent {
   server = new McpServer({
     name: "Kalshi Sports Data",
-    version: "1.1.0",
+    version: "1.2.0",
   });
 
   async init() {
     this.server.tool(
       "kalshi_list_events",
-      "Get today's open Kalshi events (games) for a sport, including nested markets (moneyline, spread, total, props).",
+      "Get today's open Kalshi events (games) for a sport. For NBA/MLB this includes nested moneyline/spread/total/props in one event. For World Cup, it returns THREE separate series (game winner, spread, total) — match legs across them by date+teams in the event ticker to find legs from the same match.",
       { sport: z.enum(["worldcup", "mlb", "nba"]) },
       async ({ sport }) => {
+        if (sport === "worldcup") {
+          const results: Record<string, unknown> = {};
+          for (const ticker of WORLDCUP_TICKERS) {
+            results[ticker] = await kalshiFetch(
+              `/events?series_ticker=${ticker}&status=open&with_nested_markets=true`
+            );
+          }
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify({
+                  note: "World Cup has 3 separate series: KXWCGAME (moneyline), KXWCSPREAD (spread), KXWCTOTAL (total goals). Match legs across them using the date+teams portion of each event ticker to find legs belonging to the same match.",
+                  series: results,
+                }),
+              },
+            ],
+          };
+        }
         const ticker = SPORT_TICKERS[sport];
         const data = await kalshiFetch(
           `/events?series_ticker=${ticker}&status=open&with_nested_markets=true`
@@ -42,7 +64,7 @@ export class MyMCP extends McpAgent {
 
     this.server.tool(
       "kalshi_get_event",
-      "Get all markets (moneyline, spread, total, player props) for one specific Kalshi game event.",
+      "Get all markets for one specific Kalshi event (one series only — for World Cup you may need to call this once per series: KXWCGAME/KXWCSPREAD/KXWCTOTAL event tickers for the same match).",
       { event_ticker: z.string() },
       async ({ event_ticker }) => {
         const data = await kalshiFetch(
@@ -77,9 +99,18 @@ export class MyMCP extends McpAgent {
 
     this.server.tool(
       "kalshi_get_combo_collections",
-      "List available Kalshi multivariate (combo/parlay) collections for a sport — shows which combo types exist and are tradeable for that sport.",
+      "List available Kalshi multivariate (combo/parlay) collections for a sport — shows what's tradeable as a real combo.",
       { sport: z.enum(["worldcup", "mlb", "nba"]) },
       async ({ sport }) => {
+        if (sport === "worldcup") {
+          const results: Record<string, unknown> = {};
+          for (const ticker of WORLDCUP_TICKERS) {
+            results[ticker] = await kalshiFetch(
+              `/multivariate_event_collections?series_ticker=${ticker}`
+            );
+          }
+          return { content: [{ type: "text", text: JSON.stringify(results) }] };
+        }
         const ticker = SPORT_TICKERS[sport];
         const data = await kalshiFetch(
           `/multivariate_event_collections?series_ticker=${ticker}`
@@ -90,17 +121,24 @@ export class MyMCP extends McpAgent {
 
     this.server.tool(
       "kalshi_get_combo_markets",
-      "Get REAL, market-priced combo (multivariate/parlay) odds for a sport — these are actual Kalshi-quoted combo prices, not estimates.",
+      "Get REAL, market-priced combo (multivariate/parlay) odds for a sport — actual Kalshi-quoted combo prices, not estimates.",
       {
         sport: z.enum(["worldcup", "mlb", "nba"]),
         collection_ticker: z.string().optional(),
       },
       async ({ sport, collection_ticker }) => {
+        if (sport === "worldcup") {
+          const results: Record<string, unknown> = {};
+          for (const ticker of WORLDCUP_TICKERS) {
+            let path = `/events/multivariate?series_ticker=${ticker}&with_nested_markets=true`;
+            if (collection_ticker) path += `&collection_ticker=${collection_ticker}`;
+            results[ticker] = await kalshiFetch(path);
+          }
+          return { content: [{ type: "text", text: JSON.stringify(results) }] };
+        }
         const ticker = SPORT_TICKERS[sport];
         let path = `/events/multivariate?series_ticker=${ticker}&with_nested_markets=true`;
-        if (collection_ticker) {
-          path += `&collection_ticker=${collection_ticker}`;
-        }
+        if (collection_ticker) path += `&collection_ticker=${collection_ticker}`;
         const data = await kalshiFetch(path);
         return { content: [{ type: "text", text: JSON.stringify(data) }] };
       }
