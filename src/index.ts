@@ -23,7 +23,7 @@ async function kalshiFetch(path: string) {
 export class MyMCP extends McpAgent {
   server = new McpServer({
     name: "Kalshi Sports Data",
-    version: "1.0.0",
+    version: "1.1.0",
   });
 
   async init() {
@@ -71,6 +71,37 @@ export class MyMCP extends McpAgent {
         const data = await kalshiFetch(
           `/markets/${market_ticker}/trades?limit=${lim}`
         );
+        return { content: [{ type: "text", text: JSON.stringify(data) }] };
+      }
+    );
+
+    this.server.tool(
+      "kalshi_get_combo_collections",
+      "List available Kalshi multivariate (combo/parlay) collections for a sport — shows which combo types exist and are tradeable for that sport.",
+      { sport: z.enum(["worldcup", "mlb", "nba"]) },
+      async ({ sport }) => {
+        const ticker = SPORT_TICKERS[sport];
+        const data = await kalshiFetch(
+          `/multivariate_event_collections?series_ticker=${ticker}`
+        );
+        return { content: [{ type: "text", text: JSON.stringify(data) }] };
+      }
+    );
+
+    this.server.tool(
+      "kalshi_get_combo_markets",
+      "Get REAL, market-priced combo (multivariate/parlay) odds for a sport — these are actual Kalshi-quoted combo prices, not estimates.",
+      {
+        sport: z.enum(["worldcup", "mlb", "nba"]),
+        collection_ticker: z.string().optional(),
+      },
+      async ({ sport, collection_ticker }) => {
+        const ticker = SPORT_TICKERS[sport];
+        let path = `/events/multivariate?series_ticker=${ticker}&with_nested_markets=true`;
+        if (collection_ticker) {
+          path += `&collection_ticker=${collection_ticker}`;
+        }
+        const data = await kalshiFetch(path);
         return { content: [{ type: "text", text: JSON.stringify(data) }] };
       }
     );
