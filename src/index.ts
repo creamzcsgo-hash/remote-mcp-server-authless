@@ -4,11 +4,16 @@ import { z } from "zod";
 
 const KALSHI_BASE = "https://api.elections.kalshi.com/trade-api/v2";
 
-const SPORT_TICKERS: Record<string, string> = {
-  mlb: "KXMLBGAME",
+// These sports have spread/total in SEPARATE series (like World Cup)
+const MULTI_SERIES_SPORTS: Record<string, string[]> = {
+  worldcup: ["KXWCGAME", "KXWCSPREAD", "KXWCTOTAL"],
+  mlb: ["KXMLBGAME", "KXMLBSPREAD", "KXMLBTOTAL"],
+};
+
+// NBA bundles moneyline/spread/total/props in one event
+const SINGLE_SERIES_SPORTS: Record<string, string> = {
   nba: "KXNBAGAME",
 };
-const WORLDCUP_TICKERS = ["KXWCGAME", "KXWCSPREAD", "KXWCTOTAL"];
 
 async function kalshiFetch(path: string) {
   const res = await fetch(`${KALSHI_BASE}${path}`, {
@@ -23,13 +28,60 @@ async function kalshiFetch(path: string) {
 export class MyMCP extends McpAgent {
   server = new McpServer({
     name: "Kalshi Sports Data",
-    version: "1.3.0",
+    version: "1.4.0",
   });
 
   async init() {
     this.server.tool(
+      "kalshi_list_events",
+      "Get today's open Kalshi events for a sport. NBA bundles all markets in one event. World Cup and MLB each have THREE separate series for moneyline/spread/total — all fetched together automatically. For props beyond these (corners, goalscorers, player HR/strikeouts etc.) use kalshi_search_series.",
+      { sport: z.enum(["worldcup", "mlb", "nba"]) },
+      async ({ sport }) => {
+        if (sport in MULTI_SERIES_SPORTS) {
+          const tickers = MULTI_SERIES_SPORTS[sport];
+          const results: Record<string, unknown> = {};
+          for (const ticker of tickers) {
+            results[ticker] = await kalshiFetch(
+              `/events?series_ticker=${ticker}&status=open&with_nested_markets=true`
+            );
+          }
+          const labels: Record<string, Record<string, string>> = {
+            worldcup: {
+              KXWCGAME: "moneyline (Win/Win/Tie)",
+              KXWCSPREAD: "spread (win by X goals)",
+              KXWCTOTAL: "total goals (over/under)",
+            },
+            mlb: {
+              KXMLBGAME: "moneyline (game winner)",
+              KXMLBSPREAD: "run line (spread)",
+              KXMLBTOTAL: "total runs (over/under)",
+            },
+          };
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify({
+                  note: `${sport.toUpperCase()} uses 3 separate series. Match legs across them using the date+teams in each event ticker to find same-game legs.`,
+                  series_labels: labels[sport],
+                  series: results,
+                }),
+              },
+            ],
+          };
+        }
+        // Single-series sport (NBA)
+        const ticker = SINGLE_SERIES_SPORTS[sport];
+        const data = await kalshiFetch(
+          `/events?series_ticker=${ticker}&status=open&with_nested_markets=true`
+        );
+        return { content: [{ type: "text", text: JSON.stringify(data) }] };
+      }
+    );
+
+    this.server.tool(
       "kalshi_search_series",
-      "Search Kalshi's full list of Sports series by keyword to discover ticker codes for prop markets (corners, anytime goalscorer, BTTS, player points/rebounds/assists, home runs, etc.) that aren't covered by the main game tools. Example keywords: 'World Cup corner', 'World Cup goalscorer', 'NBA points', 'MLB home run'.",
+      "Search Kalshi's full Sports series list by keyword to find prop series tickers (corners, anytime goalscorer, BTTS, player HR, strikeouts, points, rebounds, assists, etc.). Examples: 'World Cup corner', 'World Cup goalscorer', 'MLB home run', 'MLB strikeout', 'NBA points', 'NBA rebounds'.",
       { keyword: z.string() },
       async ({ keyword }) => {
         const data = await kalshiFetch(`/series?category=Sports&limit=1000`);
@@ -43,10 +95,13 @@ export class MyMCP extends McpAgent {
             {
               type: "text",
               text: JSON.stringify({
+                keyword,
+                match_count: matches.length,
                 matches,
-                note: matches.length === 0
-                  ? "No matches — try a shorter or different keyword (e.g. just 'corner' or 'goalscorer')."
-                  : "Use the 'ticker' field with kalshi_get_series_events to pull live data for any of these.",
+                note:
+                  matches.length === 0
+                    ? "No matches — try a shorter keyword (e.g. just 'corner' or 'home run')."
+                    : "Use the 'ticker' field with kalshi_get_series_events to pull live prices.",
               }),
             },
           ],
@@ -56,43 +111,11 @@ export class MyMCP extends McpAgent {
 
     this.server.tool(
       "kalshi_get_series_events",
-      "Get today's open events/markets for ANY Kalshi series ticker, including prop series found via kalshi_search_series (corners, goalscorers, player props, etc.).",
+      "Get today's open events/markets for ANY Kalshi series ticker — use this with tickers found via kalshi_search_series to pull live prop prices.",
       { series_ticker: z.string() },
       async ({ series_ticker }) => {
         const data = await kalshiFetch(
           `/events?series_ticker=${series_ticker}&status=open&with_nested_markets=true`
-        );
-        return { content: [{ type: "text", text: JSON.stringify(data) }] };
-      }
-    );
-
-    this.server.tool(
-      "kalshi_list_events",
-      "Get today's open Kalshi events for a sport's MAIN markets. NBA/MLB: moneyline/spread/total/props bundled in one event. World Cup: only moneyline/spread/total — use kalshi_search_series + kalshi_get_series_events for World Cup props like corners or goalscorers.",
-      { sport: z.enum(["worldcup", "mlb", "nba"]) },
-      async ({ sport }) => {
-        if (sport === "worldcup") {
-          const results: Record<string, unknown> = {};
-          for (const ticker of WORLDCUP_TICKERS) {
-            results[ticker] = await kalshiFetch(
-              `/events?series_ticker=${ticker}&status=open&with_nested_markets=true`
-            );
-          }
-          return {
-            content: [
-              {
-                type: "text",
-                text: JSON.stringify({
-                  note: "These 3 series cover moneyline/spread/total only. For World Cup props (corners, goalscorers, BTTS), use kalshi_search_series first.",
-                  series: results,
-                }),
-              },
-            ],
-          };
-        }
-        const ticker = SPORT_TICKERS[sport];
-        const data = await kalshiFetch(
-          `/events?series_ticker=${ticker}&status=open&with_nested_markets=true`
         );
         return { content: [{ type: "text", text: JSON.stringify(data) }] };
       }
@@ -112,7 +135,7 @@ export class MyMCP extends McpAgent {
 
     this.server.tool(
       "kalshi_get_market",
-      "Get details for a single Kalshi market by its market ticker (price, volume, etc.).",
+      "Get price and volume details for a single Kalshi market by its market ticker.",
       { market_ticker: z.string() },
       async ({ market_ticker }) => {
         const data = await kalshiFetch(`/markets/${market_ticker}`);
@@ -135,7 +158,7 @@ export class MyMCP extends McpAgent {
 
     this.server.tool(
       "kalshi_get_combo_markets",
-      "Get REAL, market-priced combo (multivariate/parlay) odds for any series ticker — actual Kalshi-quoted combo prices, not estimates.",
+      "Get real market-priced combo/parlay odds for any Kalshi series ticker.",
       { series_ticker: z.string() },
       async ({ series_ticker }) => {
         const data = await kalshiFetch(
