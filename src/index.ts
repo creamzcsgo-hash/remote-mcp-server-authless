@@ -250,9 +250,9 @@ export class MyMCP extends McpAgent<Env> {
         // Step 2: Submit RFQ
         let rfqId: string;
         try {
-          const res = await kalshiAuth(
+         const res = await kalshiAuth(
             "POST",
-            "/portfolio/rfqs",
+            "/communications/rfqs",
             { market_ticker: mveTicker, contracts_fp: contracts.toString() },
             keyId,
             privateKey
@@ -269,7 +269,7 @@ export class MyMCP extends McpAgent<Env> {
         for (let i = 0; i < 8; i++) {
           await new Promise((r) => setTimeout(r, 1000));
           try {
-            const res = await kalshiAuth("GET", `/portfolio/rfqs/${rfqId}/quotes`, null, keyId, privateKey);
+            const res = await kalshiAuth("GET", `/communications/quotes?rfq_id=${rfqId}&user_filter=self`, null, keyId, privateKey);
             for (const q of (res.quotes ?? [])) {
               const yb = Math.round(parseFloat(q.yes_bid_dollars ?? "0") * 100);
               if (yb > 0 && (bestYesBid === null || yb > bestYesBid)) {
@@ -283,7 +283,7 @@ export class MyMCP extends McpAgent<Env> {
 
         // Step 4: Cancel the RFQ — price check only, no trade
         try {
-          await kalshiAuth("DELETE", `/portfolio/rfqs/${rfqId}`, null, keyId, privateKey);
+          await kalshiAuth("DELETE", `/communications/rfqs/${rfqId}`, null, keyId, privateKey);
         } catch (_) {}
 
         if (bestYesBid === null) {
