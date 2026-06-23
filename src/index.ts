@@ -221,27 +221,37 @@ export class MyMCP extends McpAgent<Env> {
         }
 
         // Step 1: Create the combo market in the collection
+        // 409 = already exists, which is fine — Kalshi returns the ticker in the body
         let mveTicker: string;
         try {
-          const res = await kalshiAuth(
-            "POST",
-            `/multivariate_event_collections/${collection_ticker}`,
-            { selected_markets, with_market_payload: true },
-            keyId,
-            privateKey
+          const res = await fetch(
+            `${KALSHI_BASE}/multivariate_event_collections/${collection_ticker}`,
+            {
+              method: "POST",
+              headers: await signedHeaders("POST", `/trade-api/v2/multivariate_event_collections/${collection_ticker}`, keyId, privateKey),
+              body: JSON.stringify({ selected_markets, with_market_payload: true }),
+            }
           );
-          mveTicker = res.market_ticker ?? res.ticker;
-          if (!mveTicker) throw new Error("No market ticker returned: " + JSON.stringify(res));
+          const body = await res.json() as any;
+          if (res.status === 409) {
+            // Market already exists — ticker is in the response body
+            mveTicker = body.market_ticker ?? body.ticker ?? body.data?.market_ticker;
+            if (!mveTicker) throw new Error(`409 but no ticker in body: ${JSON.stringify(body)}`);
+          } else if (!res.ok) {
+            throw new Error(`${res.status}: ${JSON.stringify(body)}`);
+          } else {
+            mveTicker = body.market_ticker ?? body.ticker;
+            if (!mveTicker) throw new Error(`No ticker in 200 response: ${JSON.stringify(body)}`);
+          }
         } catch (e: any) {
           return {
             content: [{
               type: "text",
               text: JSON.stringify({
-                error: "Could not create combo market",
+                error: "Could not create or retrieve combo market",
                 detail: e.message,
                 collection_ticker,
                 selected_markets,
-                note: "Check that all market tickers are open and belong to events in this collection.",
               }),
             }],
           };
