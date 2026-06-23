@@ -16,22 +16,29 @@ const SINGLE_SERIES_SPORTS: Record<string, string> = {
 // ─── AUTH HELPERS ─────────────────────────────────────────────────────────────
 
 async function importPrivateKey(pem: string): Promise<CryptoKey> {
-  // Cloudflare secrets often store newlines as literal \n — fix both cases
-  const normalized = pem
-    .replace(/\\n/g, "\n")  // literal backslash-n → real newline
-    .replace(/\r/g, "");    // strip carriage returns
+  // pem is now stored as a base64-encoded PEM to avoid Cloudflare
+  // stripping spaces from header lines — decode it first
+  let decoded: string;
+  try {
+    decoded = atob(pem.trim());
+  } catch (e) {
+    throw new Error(
+      `KALSHI_PRIVATE_KEY does not appear to be base64-encoded. ` +
+      `Re-encode your PEM file using PowerShell and re-paste into Cloudflare. ` +
+      `Raw value starts with: "${pem.substring(0, 40)}"`
+    );
+  }
 
-  const pemContent = normalized
-    .replace(/-----BEGIN PRIVATE KEY-----/g, "")
-    .replace(/-----END PRIVATE KEY-----/g, "")
-    .replace(/\s+/g, "");   // strip all whitespace
+  // Now extract the key body from the decoded PEM
+  const pemContent = decoded
+    .replace(/-----BEGIN [A-Z ]+-----/g, "")
+    .replace(/-----END [A-Z ]+-----/g, "")
+    .replace(/\s+/g, "");
 
-  // Catch bad base64 before atob gives a cryptic error
   if (!/^[A-Za-z0-9+/]+=*$/.test(pemContent)) {
     throw new Error(
-      `Private key PEM is malformed after parsing. ` +
-      `Length: ${pemContent.length}, ` +
-      `starts with: "${pemContent.substring(0, 30)}"`
+      `Key body is malformed after decoding. ` +
+      `Starts with: "${pemContent.substring(0, 30)}"`
     );
   }
 
