@@ -155,18 +155,6 @@ export class MyMCP extends McpAgent {
         return { content: [{ type: "text", text: JSON.stringify(data) }] };
       }
     );
-
-    this.server.tool(
-      "kalshi_get_combo_markets",
-      "Get real market-priced combo/parlay odds for any Kalshi series ticker.",
-      { series_ticker: z.string() },
-      async ({ series_ticker }) => {
-        const data = await kalshiFetch(
-          `/events/multivariate?series_ticker=${series_ticker}&with_nested_markets=true`
-        );
-        return { content: [{ type: "text", text: JSON.stringify(data) }] };
-      }
-    );
   }
 }
 
