@@ -267,7 +267,7 @@ export class MyMCP extends McpAgent<Env> {
             keyId,
             privateKey
           );
-          rfqId = res.rfq?.rfq_id ?? res.rfq_id;
+          rfqId = res.id ?? res.rfq?.rfq_id ?? res.rfq_id;
           if (!rfqId) throw new Error("No RFQ ID returned: " + JSON.stringify(res));
         } catch (e: any) {
           return { content: [{ type: "text", text: JSON.stringify({ error: "RFQ submission failed", detail: e.message, mve_ticker: mveTicker }) }] };
