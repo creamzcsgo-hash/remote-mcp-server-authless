@@ -13,13 +13,28 @@ const SINGLE_SERIES_SPORTS: Record<string, string> = {
   nba: "KXNBAGAME",
 };
 
-// ─── AUTH HELPERS ────────────────────────────────────────────────────────────
+// ─── AUTH HELPERS ─────────────────────────────────────────────────────────────
 
 async function importPrivateKey(pem: string): Promise<CryptoKey> {
-  const pemContent = pem
+  // Cloudflare secrets often store newlines as literal \n — fix both cases
+  const normalized = pem
+    .replace(/\\n/g, "\n")  // literal backslash-n → real newline
+    .replace(/\r/g, "");    // strip carriage returns
+
+  const pemContent = normalized
     .replace(/-----BEGIN PRIVATE KEY-----/g, "")
     .replace(/-----END PRIVATE KEY-----/g, "")
-    .replace(/\s+/g, "");
+    .replace(/\s+/g, "");   // strip all whitespace
+
+  // Catch bad base64 before atob gives a cryptic error
+  if (!/^[A-Za-z0-9+/]+=*$/.test(pemContent)) {
+    throw new Error(
+      `Private key PEM is malformed after parsing. ` +
+      `Length: ${pemContent.length}, ` +
+      `starts with: "${pemContent.substring(0, 30)}"`
+    );
+  }
+
   const der = Uint8Array.from(atob(pemContent), (c) => c.charCodeAt(0));
   return crypto.subtle.importKey(
     "pkcs8",
@@ -72,7 +87,12 @@ async function kalshiAuthFetch(
   keyId: string,
   privateKey: CryptoKey
 ): Promise<any> {
-  const headers = await signedHeaders(method, `/trade-api/v2${path}`, keyId, privateKey);
+  const headers = await signedHeaders(
+    method,
+    `/trade-api/v2${path}`,
+    keyId,
+    privateKey
+  );
   const res = await fetch(`${KALSHI_BASE}${path}`, {
     method,
     headers,
@@ -91,10 +111,11 @@ interface Env {
 }
 
 export class MyMCP extends McpAgent<Env> {
-  server = new McpServer({ name: "Kalshi Sports Data", version: "1.5.0" });
+  server = new McpServer({ name: "Kalshi Sports Data", version: "1.6.0" });
 
   async init() {
-    // ── Public tools (no auth needed) ────────────────────────────────────────
+
+    // ── PUBLIC TOOLS ─────────────────────────────────────────────────────────
 
     this.server.tool(
       "kalshi_list_events",
@@ -110,7 +131,10 @@ export class MyMCP extends McpAgent<Env> {
             );
           }
           return {
-            content: [{ type: "text", text: JSON.stringify({ sport, series: results }) }],
+            content: [{
+              type: "text",
+              text: JSON.stringify({ sport, series: results }),
+            }],
           };
         }
         const ticker = SINGLE_SERIES_SPORTS[sport];
@@ -133,19 +157,17 @@ export class MyMCP extends McpAgent<Env> {
           (s.title ?? "").toLowerCase().includes(kw)
         );
         return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify({
-                keyword,
-                match_count: matches.length,
-                matches,
-                note: matches.length === 0
-                  ? "No matches — try a shorter keyword."
-                  : "Use the 'ticker' field with kalshi_get_series_events.",
-              }),
-            },
-          ],
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              keyword,
+              match_count: matches.length,
+              matches,
+              note: matches.length === 0
+                ? "No matches — try a shorter keyword."
+                : "Use the 'ticker' field with kalshi_get_series_events.",
+            }),
+          }],
         };
       }
     );
@@ -197,20 +219,35 @@ export class MyMCP extends McpAgent<Env> {
       }
     );
 
-    // ── Authenticated tool: real combo RFQ price ──────────────────────────────
+    // ── AUTHENTICATED TOOL: real combo RFQ price ──────────────────────────────
 
     this.server.tool(
       "kalshi_get_combo_price",
-      "Submit a real Kalshi RFQ for a combo and return the live quoted price from market makers. Pass an array of market tickers (the legs) — e.g. ['KXMLBGAME-26JUN22NYYBOS-T', 'KXMLBTOTAL-26JUN22NYYBOS-O8']. Returns the real yes_bid price (0-100 integer) market makers are willing to quote for this exact combo. This is the real combo multiplier, not an estimate.",
+      "Submit a real Kalshi RFQ for a combo and return the live quoted price from market makers. Pass the exact market tickers for each leg (2-4 legs). Returns the real multiplier from a live market maker quote. The RFQ is automatically cancelled after pricing so no trade is placed.",
       {
         market_tickers: z.array(z.string()).min(2).max(4),
         contracts: z.number().int().min(1).max(100).default(1),
       },
       async ({ market_tickers, contracts }) => {
+        // Load credentials
         const keyId = this.env.KALSHI_KEY_ID;
-        const privateKey = await importPrivateKey(this.env.KALSHI_PRIVATE_KEY);
+        let privateKey: CryptoKey;
+        try {
+          privateKey = await importPrivateKey(this.env.KALSHI_PRIVATE_KEY);
+        } catch (e: any) {
+          return {
+            content: [{
+              type: "text",
+              text: JSON.stringify({
+                error: "Private key import failed",
+                detail: e.message,
+                fix: "The KALSHI_PRIVATE_KEY secret in Cloudflare may be malformed. Re-paste the full PEM including the BEGIN/END lines.",
+              }),
+            }],
+          };
+        }
 
-        // Step 1: Find or create the multivariate market for these legs
+        // Step 1: Create the multivariate (combo) market for these legs
         const mveBody = {
           legs: market_tickers.map((ticker) => ({
             market_ticker: ticker,
@@ -228,27 +265,37 @@ export class MyMCP extends McpAgent<Env> {
             privateKey
           );
           mveTicker = mveRes.market_ticker ?? mveRes.ticker;
-          if (!mveTicker) throw new Error("No market ticker returned from MVE creation: " + JSON.stringify(mveRes));
+          if (!mveTicker)
+            throw new Error(
+              "No market ticker in response: " + JSON.stringify(mveRes)
+            );
         } catch (e: any) {
           return {
             content: [{
               type: "text",
               text: JSON.stringify({
-                error: "Could not create multivariate market for these legs",
+                error: "Could not create combo market for these legs",
                 detail: e.message,
-                note: "This combo may not be eligible for RFQ — legs may not be from the same event or may not be open.",
+                legs: market_tickers,
+                note: "Legs may not be from the same eligible event, or one of the markets may be closed.",
               }),
             }],
           };
         }
 
-        // Step 2: Submit RFQ
-        const rfqBody = { market_ticker: mveTicker, contracts_fp: contracts.toString() };
+        // Step 2: Submit the RFQ
         let rfqId: string;
         try {
-          const rfqRes = await kalshiAuthFetch("POST", "/portfolio/rfqs", rfqBody, keyId, privateKey);
+          const rfqRes = await kalshiAuthFetch(
+            "POST",
+            "/portfolio/rfqs",
+            { market_ticker: mveTicker, contracts_fp: contracts.toString() },
+            keyId,
+            privateKey
+          );
           rfqId = rfqRes.rfq?.rfq_id ?? rfqRes.rfq_id;
-          if (!rfqId) throw new Error("No RFQ ID returned: " + JSON.stringify(rfqRes));
+          if (!rfqId)
+            throw new Error("No RFQ ID in response: " + JSON.stringify(rfqRes));
         } catch (e: any) {
           return {
             content: [{
@@ -277,48 +324,58 @@ export class MyMCP extends McpAgent<Env> {
             );
             const quotes: any[] = quotesRes.quotes ?? [];
             for (const q of quotes) {
-              const yb = parseFloat(q.yes_bid_dollars ?? "0") * 100;
-              const nb = parseFloat(q.no_bid_dollars ?? "0") * 100;
+              const yb = Math.round(
+                parseFloat(q.yes_bid_dollars ?? "0") * 100
+              );
               if (yb > 0 && (bestYesBid === null || yb > bestYesBid)) {
-                bestYesBid = Math.round(yb);
-                bestNoBid = Math.round(nb);
+                bestYesBid = yb;
+                bestNoBid = Math.round(
+                  parseFloat(q.no_bid_dollars ?? "0") * 100
+                );
               }
             }
             if (bestYesBid !== null) break;
           } catch (_) {}
         }
 
-        // Step 4: Cancel the RFQ (we only wanted the price, not to trade)
+        // Step 4: Cancel the RFQ — we only wanted the price
         try {
-          await kalshiAuthFetch("DELETE", `/portfolio/rfqs/${rfqId}`, null, keyId, privateKey);
+          await kalshiAuthFetch(
+            "DELETE",
+            `/portfolio/rfqs/${rfqId}`,
+            null,
+            keyId,
+            privateKey
+          );
         } catch (_) {}
 
+        // Step 5: Return result
         if (bestYesBid === null) {
           return {
             content: [{
               type: "text",
               text: JSON.stringify({
+                result: "no_quote",
                 rfq_id: rfqId,
                 mve_ticker: mveTicker,
-                result: "no_quote",
-                note: "No market maker responded with a quote in 8 seconds. This combo may have low liquidity or market makers aren't active right now. Try closer to game time.",
                 legs: market_tickers,
+                note: "No market maker responded within 8 seconds. This combo may have low liquidity right now. Try again closer to game time.",
               }),
             }],
           };
         }
 
-        const multiplier = (100 / bestYesBid).toFixed(2);
         return {
           content: [{
             type: "text",
             text: JSON.stringify({
+              result: "success",
               legs: market_tickers,
               mve_ticker: mveTicker,
               yes_bid: bestYesBid,
               no_bid: bestNoBid,
-              multiplier_real: `${multiplier}x`,
-              note: "This is the REAL Kalshi RFQ price from a live market maker — not an estimate. The RFQ was cancelled after pricing so no trade was placed.",
+              multiplier: `${(100 / bestYesBid).toFixed(2)}x`,
+              note: "REAL Kalshi RFQ price from a live market maker. RFQ cancelled — no trade was placed.",
             }),
           }],
         };
@@ -326,6 +383,8 @@ export class MyMCP extends McpAgent<Env> {
     );
   }
 }
+
+// ─── ENTRY POINT ─────────────────────────────────────────────────────────────
 
 export default {
   fetch(request: Request, env: Env, ctx: ExecutionContext) {
