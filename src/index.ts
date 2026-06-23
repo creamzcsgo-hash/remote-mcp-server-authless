@@ -263,22 +263,41 @@ export class MyMCP extends McpAgent<Env> {
           return { content: [{ type: "text", text: JSON.stringify({ error: "RFQ submission failed", detail: e.message, mve_ticker: mveTicker }) }] };
         }
 
-        // Step 3: Poll for quotes (up to 8 seconds)
+// Step 3: Poll for quotes (up to 10 seconds, log raw response for debugging)
         let bestYesBid: number | null = null;
         let bestNoBid: number | null = null;
-        for (let i = 0; i < 8; i++) {
+        let lastQuoteResponse: unknown = null;
+        for (let i = 0; i < 10; i++) {
           await new Promise((r) => setTimeout(r, 1000));
           try {
-            const res = await kalshiAuth("GET", `/communications/quotes?rfq_id=${rfqId}&user_filter=self`, null, keyId, privateKey);
-            for (const q of (res.quotes ?? [])) {
-              const yb = Math.round(parseFloat(q.yes_bid_dollars ?? "0") * 100);
+            // Primary: poll quotes filtered by this RFQ
+            const res = await kalshiAuth(
+              "GET",
+              `/communications/quotes?rfq_id=${rfqId}&user_filter=self`,
+              null,
+              keyId,
+              privateKey
+            );
+            lastQuoteResponse = res;
+            const quotes: any[] = res.quotes ?? res.data ?? [];
+            for (const q of quotes) {
+              // Try both dollar and integer price fields
+              const ybDollars = parseFloat(q.yes_bid_dollars ?? q.yes_price_dollars ?? "0");
+              const yb = ybDollars > 1
+                ? Math.round(ybDollars)           // already 0-100 integer
+                : Math.round(ybDollars * 100);    // decimal e.g. 0.56 → 56
               if (yb > 0 && (bestYesBid === null || yb > bestYesBid)) {
                 bestYesBid = yb;
-                bestNoBid = Math.round(parseFloat(q.no_bid_dollars ?? "0") * 100);
+                const nbDollars = parseFloat(q.no_bid_dollars ?? q.no_price_dollars ?? "0");
+                bestNoBid = nbDollars > 1
+                  ? Math.round(nbDollars)
+                  : Math.round(nbDollars * 100);
               }
             }
             if (bestYesBid !== null) break;
-          } catch (_) {}
+          } catch (e: any) {
+            lastQuoteResponse = { poll_error: e.message };
+          }
         }
 
         // Step 4: Cancel the RFQ — price check only, no trade
@@ -286,7 +305,7 @@ export class MyMCP extends McpAgent<Env> {
           await kalshiAuth("DELETE", `/communications/rfqs/${rfqId}`, null, keyId, privateKey);
         } catch (_) {}
 
-        if (bestYesBid === null) {
+       if (bestYesBid === null) {
           return {
             content: [{
               type: "text",
@@ -295,7 +314,8 @@ export class MyMCP extends McpAgent<Env> {
                 rfq_id: rfqId,
                 mve_ticker: mveTicker,
                 legs: selected_markets.map(m => m.market_ticker),
-                note: "No market maker responded in 8 seconds. Try again closer to game time when more quoters are active.",
+                last_quote_response: lastQuoteResponse,
+                note: "No quote price found after 10 seconds. Check last_quote_response above — if quotes array is empty, no market maker responded yet. If it has data but no price was extracted, the field names may differ.",
               }),
             }],
           };
