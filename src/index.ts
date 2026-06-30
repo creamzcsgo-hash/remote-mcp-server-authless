@@ -64,10 +64,12 @@ async function signedHeaders(
   privateKey: CryptoKey
 ): Promise<Record<string, string>> {
   const ts = Date.now().toString();
+  // Kalshi signs only the path — strip query string before signing
+  const pathOnly = path.split("?")[0];
   const sig = await crypto.subtle.sign(
     { name: "RSA-PSS", saltLength: 32 },
     privateKey,
-    new TextEncoder().encode(ts + method.toUpperCase() + path)
+    new TextEncoder().encode(ts + method.toUpperCase() + pathOnly)
   );
   return {
     "Content-Type": "application/json",
