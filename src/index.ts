@@ -256,27 +256,62 @@ export class MyMCP extends McpAgent<Env> {
 
     this.server.tool(
       "kalshi_get_combo_price",
-      "Submit a real Kalshi RFQ and return the live quoted multiplier. RFQ cancelled after — no trade placed. Default collection: KXMVESPORTSMULTIGAMEEXTENDED-R.",
+      "Submit a real Kalshi RFQ and return the live quoted multiplier. ALWAYS returns an estimated multiplier instantly from leg yes_bid prices. Real RFQ quote is a bonus on top if market makers are active. RFQ cancelled after — no trade placed.",
       {
         collection_ticker: z.string().default("KXMVESPORTSMULTIGAMEEXTENDED-R"),
         selected_markets: z.array(z.object({
           market_ticker: z.string(),
           event_ticker: z.string(),
           side: z.enum(["yes", "no"]).default("yes"),
+          yes_bid: z.number().optional(), // pass yb from market data for instant estimate
         })).min(2).max(4),
         contracts: z.number().int().min(1).max(100).default(1),
       },
       async ({ collection_ticker, selected_markets, contracts }) => {
+
+        // Always compute estimated multiplier immediately from passed-in prices
+        // If yes_bid not passed, fetch each market individually
+        const legPrices: number[] = [];
+        for (const leg of selected_markets) {
+          if (leg.yes_bid && leg.yes_bid > 0) {
+            legPrices.push(leg.side === "no" ? (100 - leg.yes_bid) : leg.yes_bid);
+          } else {
+            try {
+              const md = await pub(`/markets/${leg.market_ticker}`);
+              const price = leg.side === "no"
+                ? toInt(md.market?.no_bid_dollars ?? md.no_bid_dollars)
+                : toInt(md.market?.yes_bid_dollars ?? md.yes_bid_dollars);
+              legPrices.push(price > 0 ? price : 50);
+            } catch { legPrices.push(50); }
+          }
+        }
+
+        const estMultiplier = legPrices.reduce((acc, p) => acc * (100 / p), 1);
+
+        // Attempt auth
         let kid: string;
         let pk: CryptoKey;
         try {
           kid = this.env.KALSHI_KEY_ID;
           pk = await importPrivateKey(this.env.KALSHI_PRIVATE_KEY);
         } catch (e: any) {
-          return { content: [{ type: "text", text: JSON.stringify({ error: "Auth failed", detail: e.message }) }] };
+          // Auth failed but we still have the estimate
+          return {
+            content: [{
+              type: "text",
+              text: JSON.stringify({
+                result: "estimate_only",
+                legs: selected_markets.map(m => m.market_ticker),
+                leg_prices: legPrices,
+                estimated_multiplier: `${estMultiplier.toFixed(2)}x`,
+                real_multiplier: null,
+                note: "Auth unavailable — estimated multiplier only.",
+              }),
+            }],
+          };
         }
 
-        // Step 1: Create or reuse MVE (409 = already exists)
+        // Step 1: Create or reuse MVE
         let mveTicker: string;
         try {
           const mveH = await makeHeaders(
@@ -288,21 +323,40 @@ export class MyMCP extends McpAgent<Env> {
             `${KALSHI_AUTH_BASE}/multivariate_event_collections/${collection_ticker}`,
             {
               method: "POST", headers: mveH,
-              body: JSON.stringify({ selected_markets, with_market_payload: true }),
+              body: JSON.stringify({
+                selected_markets: selected_markets.map(m => ({
+                  market_ticker: m.market_ticker,
+                  event_ticker: m.event_ticker,
+                  side: m.side,
+                })),
+                with_market_payload: true,
+              }),
             }
           );
           const mveBody = await mveRes.json() as any;
           if (mveRes.status === 409) {
             mveTicker = mveBody.market_ticker ?? mveBody.ticker ?? mveBody.data?.market_ticker;
-            if (!mveTicker) throw new Error(`409 no ticker: ${JSON.stringify(mveBody)}`);
+            if (!mveTicker) throw new Error(`409 no ticker`);
           } else if (!mveRes.ok) {
-            throw new Error(`${mveRes.status}: ${JSON.stringify(mveBody)}`);
+            throw new Error(`${mveRes.status}`);
           } else {
             mveTicker = mveBody.market_ticker ?? mveBody.ticker;
-            if (!mveTicker) throw new Error(`No ticker: ${JSON.stringify(mveBody)}`);
+            if (!mveTicker) throw new Error(`No ticker`);
           }
         } catch (e: any) {
-          return { content: [{ type: "text", text: JSON.stringify({ error: "MVE failed", detail: e.message }) }] };
+          return {
+            content: [{
+              type: "text",
+              text: JSON.stringify({
+                result: "estimate_only",
+                legs: selected_markets.map(m => m.market_ticker),
+                leg_prices: legPrices,
+                estimated_multiplier: `${estMultiplier.toFixed(2)}x`,
+                real_multiplier: null,
+                note: `MVE creation failed (${e.message}) — estimated multiplier from live leg prices.`,
+              }),
+            }],
+          };
         }
 
         // Step 2: Submit RFQ
@@ -314,15 +368,27 @@ export class MyMCP extends McpAgent<Env> {
             kid, pk
           );
           rfqId = rfqRes.id ?? rfqRes.rfq?.rfq_id ?? rfqRes.rfq_id;
-          if (!rfqId) throw new Error("No ID: " + JSON.stringify(rfqRes));
+          if (!rfqId) throw new Error("No ID");
         } catch (e: any) {
-          return { content: [{ type: "text", text: JSON.stringify({ error: "RFQ failed", detail: e.message, mve: mveTicker }) }] };
+          return {
+            content: [{
+              type: "text",
+              text: JSON.stringify({
+                result: "estimate_only",
+                legs: selected_markets.map(m => m.market_ticker),
+                leg_prices: legPrices,
+                estimated_multiplier: `${estMultiplier.toFixed(2)}x`,
+                real_multiplier: null,
+                mve: mveTicker,
+                note: `RFQ failed (${e.message}) — estimated multiplier from live leg prices.`,
+              }),
+            }],
+          };
         }
 
-        // Step 3: Poll for quotes — GET signs path only, no Content-Type
+        // Step 3: Poll for quotes
         let bestYesBid: number | null = null;
         let bestNoBid: number | null = null;
-        let lastRes: unknown = null;
         for (let i = 0; i < 10; i++) {
           await new Promise(r => setTimeout(r, 1000));
           try {
@@ -330,9 +396,7 @@ export class MyMCP extends McpAgent<Env> {
               `/communications/quotes?rfq_id=${rfqId}&user_filter=self`,
               kid, pk
             );
-            lastRes = qRes;
             for (const q of (qRes.quotes ?? qRes.data ?? [])) {
-              // Quotes may return dollar strings or cent integers — handle both
               const ybRaw = parseFloat(q.yes_bid_dollars ?? q.yes_price_dollars ?? "0");
               const yb = ybRaw <= 1 ? Math.round(ybRaw * 100) : Math.round(ybRaw);
               if (yb > 0 && (bestYesBid === null || yb > bestYesBid)) {
@@ -342,46 +406,36 @@ export class MyMCP extends McpAgent<Env> {
               }
             }
             if (bestYesBid !== null) break;
-          } catch (e: any) { lastRes = { err: e.message }; }
+          } catch (_) {}
         }
 
         // Step 4: Cancel RFQ
         try { await authDelete(`/communications/rfqs/${rfqId}`, kid, pk); } catch (_) {}
 
-        if (bestYesBid === null) {
-          return {
-            content: [{
-              type: "text",
-              text: JSON.stringify({
-                result: "no_quote",
-                rfq_id: rfqId,
-                mve: mveTicker,
-                legs: selected_markets.map(m => m.market_ticker),
-                last: lastRes,
-                note: "No market maker active yet. Use estimated multiplier.",
-              }),
-            }],
-          };
-        }
+        const realMultiplier = bestYesBid !== null
+          ? `${(100 / bestYesBid).toFixed(2)}x`
+          : null;
 
         return {
           content: [{
             type: "text",
             text: JSON.stringify({
-              result: "success",
+              result: bestYesBid !== null ? "success" : "estimate_only",
               legs: selected_markets.map(m => m.market_ticker),
-              mve: mveTicker,
+              leg_prices: legPrices,
+              estimated_multiplier: `${estMultiplier.toFixed(2)}x`,
+              real_multiplier: realMultiplier,
               yes_bid: bestYesBid,
               no_bid: bestNoBid,
-              multiplier: `${(100 / bestYesBid).toFixed(2)}x`,
-              note: "REAL RFQ price. No trade placed.",
+              mve: mveTicker,
+              note: bestYesBid !== null
+                ? "Real RFQ price from live market maker. No trade placed."
+                : "No market maker active — estimated multiplier from live leg prices.",
             }),
           }],
         };
       }
     );
-  }
-}
 
 export default {
   fetch(request: Request, env: Env, ctx: ExecutionContext) {
