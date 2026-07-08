@@ -243,30 +243,19 @@ export class MyMCP extends McpAgent<Env> {
           market_ticker: z.string(),
           event_ticker: z.string(),
           side: z.enum(["yes", "no"]).default("yes"),
-          yes_bid: z.number().optional(),
+          yes_bid: z.number().min(1).max(99),
         })).min(2).max(4),
         contracts: z.number().int().min(1).max(100).default(1),
       },
       async ({ collection_ticker, selected_markets, contracts }) => {
 
-        // Always compute estimated multiplier from passed-in or fetched prices
-        const legPrices: number[] = [];
-        for (const leg of selected_markets) {
-          if (leg.yes_bid && leg.yes_bid > 0) {
-            legPrices.push(leg.side === "no" ? (100 - leg.yes_bid) : leg.yes_bid);
-          } else {
-            try {
-              const md = await pub(`/markets/${leg.market_ticker}`);
-              const price = leg.side === "no"
-                ? toInt(md.market?.no_bid_dollars ?? md.no_bid_dollars)
-                : toInt(md.market?.yes_bid_dollars ?? md.yes_bid_dollars);
-              legPrices.push(price > 0 ? price : 50);
-            } catch { legPrices.push(50); }
-          }
-        }
-        const estMultiplier = legPrices.reduce((acc, p) => acc * (100 / p), 1);
+        // yes_bid is now required — no fallback fetches, no placeholder 50s
+        const legPrices: number[] = selected_markets.map(leg =>
+          leg.side === "no" ? (100 - leg.yes_bid) : leg.yes_bid
+        );
+        const estMultiplier = legPrices.reduce((acc, p) => acc * (100 / Math.max(p, 1)), 1);
 
-        // Attempt auth
+        // Wrap everything from here in try/catch — always return estimate on any error
         let kid: string;
         let pk: CryptoKey;
         try {
@@ -282,11 +271,12 @@ export class MyMCP extends McpAgent<Env> {
                 leg_prices: legPrices,
                 estimated_multiplier: `${estMultiplier.toFixed(2)}x`,
                 real_multiplier: null,
-                note: "Auth unavailable — estimated multiplier only.",
+                note: "Auth unavailable.",
               }),
             }],
           };
         }
+        try {
 
         // Step 1: Create or reuse MVE (409 = already exists)
         let mveTicker: string;
@@ -407,10 +397,23 @@ export class MyMCP extends McpAgent<Env> {
             }),
           }],
         };
+        } catch (e: any) {
+          return {
+            content: [{
+              type: "text",
+              text: JSON.stringify({
+                result: "estimate_only",
+                legs: selected_markets.map(m => m.market_ticker),
+                leg_prices: legPrices,
+                estimated_multiplier: `${estMultiplier.toFixed(2)}x`,
+                real_multiplier: null,
+                note: `Execution error — estimated multiplier from live leg prices. Detail: ${e.message}`,
+              }),
+            }],
+          };
+        }
       }
     );
-  }
-}
 
 export default {
   fetch(request: Request, env: Env, ctx: ExecutionContext) {
