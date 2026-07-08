@@ -7,42 +7,40 @@ const KALSHI_AUTH_BASE = "https://api.elections.kalshi.com/trade-api/v2";
 
 const SERIES: Record<string, string[]> = {
   worldcup: [
-    "KXWCGAME", "KXWCSPREAD", "KXWCTOTAL", "KXWCSCORE",
-    "KXWCBTTS", "KXWCTT", "KXWC1H", "KXWC1HSPREAD",
-    "KXWC1HTOTAL", "KXWC1HBTTS", "KXWCGOAL", "KXWCCORNERS", "KXWCADVANCE",
+    "KXWCGAME","KXWCSPREAD","KXWCTOTAL","KXWCSCORE",
+    "KXWCBTTS","KXWCTT","KXWC1H","KXWC1HSPREAD",
+    "KXWC1HTOTAL","KXWC1HBTTS","KXWCGOAL","KXWCCORNERS","KXWCADVANCE",
   ],
-  mlb: ["KXMLBGAME", "KXMLBSPREAD", "KXMLBTOTAL"],
+  mlb: ["KXMLBGAME","KXMLBSPREAD","KXMLBTOTAL"],
   nba: ["KXNBAGAME"],
 };
-
-// ─── AUTH ─────────────────────────────────────────────────────────────────────
 
 async function importPrivateKey(pem: string): Promise<CryptoKey> {
   let decoded: string;
   try { decoded = atob(pem.trim()); }
-  catch { throw new Error(`KALSHI_PRIVATE_KEY not valid base64. Starts: "${pem.substring(0, 40)}"`); }
+  catch { throw new Error(`PEM not valid base64. Starts: "${pem.substring(0,40)}"`); }
   const body = decoded
-    .replace(/-----BEGIN [A-Z ]+-----/g, "")
-    .replace(/-----END [A-Z ]+-----/g, "")
-    .replace(/\s+/g, "");
+    .replace(/-----BEGIN [A-Z ]+-----/g,"")
+    .replace(/-----END [A-Z ]+-----/g,"")
+    .replace(/\s+/g,"");
   if (!/^[A-Za-z0-9+/]+=*$/.test(body))
-    throw new Error(`Key malformed. Starts: "${body.substring(0, 30)}"`);
+    throw new Error(`Key body malformed. Starts: "${body.substring(0,30)}"`);
   const der = Uint8Array.from(atob(body), c => c.charCodeAt(0));
   return crypto.subtle.importKey(
-    "pkcs8", der, { name: "RSA-PSS", hash: "SHA-256" }, false, ["sign"]
+    "pkcs8", der, { name:"RSA-PSS", hash:"SHA-256" }, false, ["sign"]
   );
 }
 
 async function makeHeaders(
   method: string, path: string, keyId: string, pk: CryptoKey, hasBody = false
-): Promise<Record<string, string>> {
+): Promise<Record<string,string>> {
   const ts = Date.now().toString();
   const pathOnly = path.split("?")[0];
   const sig = await crypto.subtle.sign(
-    { name: "RSA-PSS", saltLength: 32 }, pk,
+    { name:"RSA-PSS", saltLength:32 }, pk,
     new TextEncoder().encode(ts + method.toUpperCase() + pathOnly)
   );
-  const h: Record<string, string> = {
+  const h: Record<string,string> = {
     Accept: "application/json",
     "KALSHI-ACCESS-KEY": keyId,
     "KALSHI-ACCESS-TIMESTAMP": ts,
@@ -52,41 +50,38 @@ async function makeHeaders(
   return h;
 }
 
-// ─── FETCH WRAPPERS ───────────────────────────────────────────────────────────
+function toInt(s: string|undefined): number {
+  if (!s) return 0;
+  const v = parseFloat(s);
+  return Math.round(v <= 1 ? v * 100 : v);
+}
 
-async function pub(path: string): Promise<any> {
-  const r = await fetch(`${KALSHI_BASE}${path}`, { headers: { Accept: "application/json" } });
+async function pubFetch(path: string): Promise<any> {
+  const r = await fetch(`${KALSHI_BASE}${path}`, { headers:{ Accept:"application/json" } });
   if (!r.ok) throw new Error(`${r.status}: ${await r.text()}`);
   return r.json();
 }
 
 async function authGet(path: string, kid: string, pk: CryptoKey): Promise<any> {
   const h = await makeHeaders("GET", `/trade-api/v2${path}`, kid, pk, false);
-  const r = await fetch(`${KALSHI_AUTH_BASE}${path}`, { method: "GET", headers: h });
+  const r = await fetch(`${KALSHI_AUTH_BASE}${path}`, { method:"GET", headers:h });
   if (!r.ok) throw new Error(`${r.status}: ${await r.text()}`);
   return r.json();
 }
 
 async function authPost(path: string, body: unknown, kid: string, pk: CryptoKey): Promise<any> {
   const h = await makeHeaders("POST", `/trade-api/v2${path}`, kid, pk, true);
-  const r = await fetch(`${KALSHI_AUTH_BASE}${path}`, { method: "POST", headers: h, body: JSON.stringify(body) });
+  const r = await fetch(`${KALSHI_AUTH_BASE}${path}`, { method:"POST", headers:h, body:JSON.stringify(body) });
   if (!r.ok) throw new Error(`${r.status}: ${await r.text()}`);
   return r.json();
 }
 
 async function authDelete(path: string, kid: string, pk: CryptoKey): Promise<void> {
   const h = await makeHeaders("DELETE", `/trade-api/v2${path}`, kid, pk, false);
-  await fetch(`${KALSHI_AUTH_BASE}${path}`, { method: "DELETE", headers: h });
+  await fetch(`${KALSHI_AUTH_BASE}${path}`, { method:"DELETE", headers:h });
 }
 
-// ─── COMPACT EXTRACTOR ────────────────────────────────────────────────────────
-
-function toInt(dollarStr: string | undefined): number {
-  if (!dollarStr) return 0;
-  return Math.round(parseFloat(dollarStr) * 100);
-}
-
-function compact(events: any[], series: string): any[] {
+function extractMarkets(events: any[], series: string): any[] {
   const rows: any[] = [];
   for (const ev of events ?? []) {
     for (const m of ev.markets ?? []) {
@@ -99,9 +94,9 @@ function compact(events: any[], series: string): any[] {
         s: series,
         et: ev.event_ticker,
         mt: m.ticker,
-        t: (m.yes_sub_title ?? m.title ?? "").substring(0, 60),
+        t: (m.yes_sub_title ?? m.title ?? "").substring(0,60),
         yb, ya, nb,
-        vol: m.volume_fp ?? m.volume,
+        vol: m.volume_fp ?? m.volume ?? 0,
       });
     }
   }
@@ -111,8 +106,10 @@ function compact(events: any[], series: string): any[] {
 async function fetchSeries(ticker: string): Promise<any[]> {
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
-      const d = await pub(`/events?series_ticker=${ticker}&status=open&with_nested_markets=true`);
-      return compact(d.events ?? [], ticker);
+      const d = await pubFetch(
+        `/events?series_ticker=${ticker}&status=open&with_nested_markets=true`
+      );
+      return extractMarkets(d.events ?? [], ticker);
     } catch (e: any) {
       if (e.message.startsWith("429") && attempt < 2) {
         await new Promise(r => setTimeout(r, 2000 * (attempt + 1)));
@@ -124,30 +121,28 @@ async function fetchSeries(ticker: string): Promise<any[]> {
   return [];
 }
 
-// ─── AGENT ───────────────────────────────────────────────────────────────────
-
 interface Env { KALSHI_KEY_ID: string; KALSHI_PRIVATE_KEY: string; }
 
 export class MyMCP extends McpAgent<Env> {
-  server = new McpServer({ name: "Kalshi Sports Data", version: "2.3.0" });
+  server = new McpServer({ name:"Kalshi Sports Data", version:"2.4.0" });
 
   async init() {
 
     this.server.tool(
       "kalshi_get_all_today",
-      "PRIMARY TOOL. Fetches ALL open active markets for World Cup + MLB + NBA in one call. Returns compact rows grouped by game. Fields: s=series, et=event_ticker, mt=market_ticker, t=title, yb=yes_bid(0-100), ya=yes_ask(0-100), nb=no_bid(0-100), vol=volume. Multiplier per leg = 100/yb.",
+      "PRIMARY TOOL. Returns all open active Kalshi markets for World Cup + MLB + NBA grouped by game. Fields: s=series, et=event_ticker, mt=market_ticker, t=title, yb=yes_bid(0-100), ya=yes_ask, nb=no_bid, vol=volume. Multiplier per leg = 100/yb.",
       {},
       async () => {
-        const result: Record<string, any> = {};
-        for (const sport of ["worldcup", "mlb", "nba"] as const) {
-          const byEvent: Record<string, any[]> = {};
+        const result: Record<string,any> = {};
+        for (const sport of ["worldcup","mlb","nba"] as const) {
+          const byEvent: Record<string,any[]> = {};
           for (const ticker of SERIES[sport]) {
             const rows = await fetchSeries(ticker);
-            for (const r of rows) {
-              if (!byEvent[r.et]) byEvent[r.et] = [];
-              byEvent[r.et].push(r);
+            for (const row of rows) {
+              if (!byEvent[row.et]) byEvent[row.et] = [];
+              byEvent[row.et].push(row);
             }
-            await new Promise(res => setTimeout(res, 150));
+            await new Promise(r => setTimeout(r, 150));
           }
           result[sport] = {
             games: byEvent,
@@ -155,130 +150,125 @@ export class MyMCP extends McpAgent<Env> {
             market_count: Object.values(byEvent).flat().length,
           };
         }
-        return { content: [{ type: "text", text: JSON.stringify(result) }] };
+        return { content:[{ type:"text", text:JSON.stringify(result) }] };
       }
     );
 
     this.server.tool(
       "kalshi_get_today_markets",
-      "Fetch open active markets for one sport only.",
-      { sport: z.enum(["worldcup", "mlb", "nba"]) },
+      "Returns all open active markets for one sport only. Use kalshi_get_all_today for the full daily briefing.",
+      { sport: z.enum(["worldcup","mlb","nba"]) },
       async ({ sport }) => {
-        const byEvent: Record<string, any[]> = {};
+        const byEvent: Record<string,any[]> = {};
         for (const ticker of SERIES[sport]) {
           const rows = await fetchSeries(ticker);
-          for (const r of rows) {
-            if (!byEvent[r.et]) byEvent[r.et] = [];
-            byEvent[r.et].push(r);
+          for (const row of rows) {
+            if (!byEvent[row.et]) byEvent[row.et] = [];
+            byEvent[row.et].push(row);
           }
-          await new Promise(res => setTimeout(res, 150));
+          await new Promise(r => setTimeout(r, 150));
         }
         return {
-          content: [{
-            type: "text",
-            text: JSON.stringify({
-              sport, games: byEvent,
-              game_count: Object.keys(byEvent).length,
-              market_count: Object.values(byEvent).flat().length,
-            }),
-          }],
+          content:[{ type:"text", text:JSON.stringify({
+            sport, games:byEvent,
+            game_count: Object.keys(byEvent).length,
+            market_count: Object.values(byEvent).flat().length,
+          }) }],
         };
       }
     );
 
     this.server.tool(
       "kalshi_get_event",
-      "Deep dive on one specific game event ticker.",
+      "Get all markets for one specific game event ticker.",
       { event_ticker: z.string() },
       async ({ event_ticker }) => {
-        const data = await pub(`/events/${event_ticker}?with_nested_markets=true`);
-        const markets = compact([data.event ?? data], event_ticker);
-        return { content: [{ type: "text", text: JSON.stringify({ event_ticker, markets }) }] };
+        const data = await pubFetch(`/events/${event_ticker}?with_nested_markets=true`);
+        const markets = extractMarkets([data.event ?? data], event_ticker);
+        return { content:[{ type:"text", text:JSON.stringify({ event_ticker, markets }) }] };
       }
     );
 
     this.server.tool(
       "kalshi_search_series",
-      "Find any Kalshi sports series ticker by keyword.",
+      "Search for any Kalshi sports series ticker by keyword (corners, goalscorer, props etc).",
       { keyword: z.string() },
       async ({ keyword }) => {
-        const data = await pub(`/series?category=Sports&limit=1000`);
+        const data = await pubFetch(`/series?category=Sports&limit=1000`);
         const kw = keyword.toLowerCase();
         const matches = ((data as any).series ?? [])
           .filter((s: any) =>
             (s.title ?? "").toLowerCase().includes(kw) ||
             (s.ticker ?? "").toLowerCase().includes(kw)
           )
-          .slice(0, 20)
-          .map((s: any) => ({ ticker: s.ticker, title: s.title }));
-        return { content: [{ type: "text", text: JSON.stringify({ keyword, matches }) }] };
+          .slice(0,20)
+          .map((s: any) => ({ ticker:s.ticker, title:s.title }));
+        return { content:[{ type:"text", text:JSON.stringify({ keyword, matches }) }] };
       }
     );
 
     this.server.tool(
       "kalshi_get_combo_collections",
-      "Find combo collection tickers for a game. Fallback: KXMVESPORTSMULTIGAMEEXTENDED-R.",
+      "Find combo collection tickers for a game event. Default fallback: KXMVESPORTSMULTIGAMEEXTENDED-R.",
       { event_ticker: z.string() },
       async ({ event_ticker }) => {
-        const data = await pub(`/multivariate_event_collections?event_ticker=${event_ticker}&status=open`);
+        const data = await pubFetch(
+          `/multivariate_event_collections?event_ticker=${event_ticker}&status=open`
+        );
         const cols = (data as any).multivariate_contracts ?? [];
         return {
-          content: [{
-            type: "text",
-            text: JSON.stringify({
-              collections: cols.map((c: any) => ({ collection_ticker: c.collection_ticker, title: c.title })),
-              fallback: "KXMVESPORTSMULTIGAMEEXTENDED-R",
-            }),
-          }],
+          content:[{ type:"text", text:JSON.stringify({
+            collections: cols.map((c: any) => ({ collection_ticker:c.collection_ticker, title:c.title })),
+            fallback: "KXMVESPORTSMULTIGAMEEXTENDED-R",
+          }) }],
         };
       }
     );
 
     this.server.tool(
       "kalshi_get_combo_price",
-      "Submit a real Kalshi RFQ and return the live quoted multiplier. ALWAYS returns estimated_multiplier from live leg prices instantly. real_multiplier is a bonus if market makers are active. RFQ cancelled after — no trade placed.",
+      "Gets the combo multiplier for a set of legs. Always returns estimated_multiplier instantly from the yb prices you pass in. Also attempts a live RFQ for a real market-maker quote — real_multiplier is populated if one responds. Pass yb from board data for each leg. RFQ is cancelled after — no trade placed.",
       {
         collection_ticker: z.string().default("KXMVESPORTSMULTIGAMEEXTENDED-R"),
         selected_markets: z.array(z.object({
           market_ticker: z.string(),
           event_ticker: z.string(),
-          side: z.enum(["yes", "no"]).default("yes"),
-          yes_bid: z.number().min(1).max(99),
+          side: z.enum(["yes","no"]).default("yes"),
+          yb: z.number().int().min(1).max(99),
         })).min(2).max(4),
         contracts: z.number().int().min(1).max(100).default(1),
       },
       async ({ collection_ticker, selected_markets, contracts }) => {
 
-        // yes_bid is now required — no fallback fetches, no placeholder 50s
-        const legPrices: number[] = selected_markets.map(leg =>
-          leg.side === "no" ? (100 - leg.yes_bid) : leg.yes_bid
+        // Estimated multiplier — always available immediately
+        const legPrices = selected_markets.map(leg =>
+          leg.side === "no" ? (100 - leg.yb) : leg.yb
         );
-        const estMultiplier = legPrices.reduce((acc, p) => acc * (100 / Math.max(p, 1)), 1);
+        const estMultiplier = legPrices
+          .reduce((acc, p) => acc * (100 / Math.max(p, 1)), 1)
+          .toFixed(2);
 
-        // Wrap everything from here in try/catch — always return estimate on any error
+        const baseResult = {
+          legs: selected_markets.map(m => ({ mt:m.market_ticker, side:m.side, yb:m.yb })),
+          leg_prices: legPrices,
+          estimated_multiplier: `${estMultiplier}x`,
+          real_multiplier: null as string|null,
+        };
+
+        // Attempt live RFQ
         let kid: string;
         let pk: CryptoKey;
         try {
           kid = this.env.KALSHI_KEY_ID;
           pk = await importPrivateKey(this.env.KALSHI_PRIVATE_KEY);
         } catch (e: any) {
-          return {
-            content: [{
-              type: "text",
-              text: JSON.stringify({
-                result: "estimate_only",
-                legs: selected_markets.map(m => m.market_ticker),
-                leg_prices: legPrices,
-                estimated_multiplier: `${estMultiplier.toFixed(2)}x`,
-                real_multiplier: null,
-                note: "Auth unavailable.",
-              }),
-            }],
-          };
+          return { content:[{ type:"text", text:JSON.stringify({
+            ...baseResult, result:"estimate_only",
+            note:`Auth failed: ${e.message}`,
+          }) }] };
         }
-        try {
 
-        // Step 1: Create or reuse MVE (409 = already exists)
+        // MVE creation
         let mveTicker: string;
         try {
           const mveH = await makeHeaders(
@@ -289,8 +279,8 @@ export class MyMCP extends McpAgent<Env> {
           const mveRes = await fetch(
             `${KALSHI_AUTH_BASE}/multivariate_event_collections/${collection_ticker}`,
             {
-              method: "POST", headers: mveH,
-              body: JSON.stringify({
+              method:"POST", headers:mveH,
+              body:JSON.stringify({
                 selected_markets: selected_markets.map(m => ({
                   market_ticker: m.market_ticker,
                   event_ticker: m.event_ticker,
@@ -303,59 +293,40 @@ export class MyMCP extends McpAgent<Env> {
           const mveBody = await mveRes.json() as any;
           if (mveRes.status === 409) {
             mveTicker = mveBody.market_ticker ?? mveBody.ticker ?? mveBody.data?.market_ticker;
-            if (!mveTicker) throw new Error(`409 no ticker`);
-          } else if (!mveRes.ok) {
-            throw new Error(`${mveRes.status}: ${JSON.stringify(mveBody)}`);
-          } else {
+          } else if (mveRes.ok) {
             mveTicker = mveBody.market_ticker ?? mveBody.ticker;
-            if (!mveTicker) throw new Error(`No ticker`);
+          } else {
+            throw new Error(`${mveRes.status}: ${JSON.stringify(mveBody)}`);
           }
+          if (!mveTicker!) throw new Error("No MVE ticker in response");
         } catch (e: any) {
-          return {
-            content: [{
-              type: "text",
-              text: JSON.stringify({
-                result: "estimate_only",
-                legs: selected_markets.map(m => m.market_ticker),
-                leg_prices: legPrices,
-                estimated_multiplier: `${estMultiplier.toFixed(2)}x`,
-                real_multiplier: null,
-                note: `MVE failed (${e.message}) — estimated multiplier from live leg prices.`,
-              }),
-            }],
-          };
+          return { content:[{ type:"text", text:JSON.stringify({
+            ...baseResult, result:"estimate_only",
+            note:`MVE failed: ${e.message}`,
+          }) }] };
         }
 
-        // Step 2: Submit RFQ
+        // RFQ submission
         let rfqId: string;
         try {
           const rfqRes = await authPost(
             "/communications/rfqs",
-            { market_ticker: mveTicker, contracts_fp: contracts.toString() },
+            { market_ticker:mveTicker, contracts_fp:contracts.toString() },
             kid, pk
           );
           rfqId = rfqRes.id ?? rfqRes.rfq?.rfq_id ?? rfqRes.rfq_id;
-          if (!rfqId) throw new Error("No ID: " + JSON.stringify(rfqRes));
+          if (!rfqId) throw new Error("No RFQ ID in: " + JSON.stringify(rfqRes));
         } catch (e: any) {
-          return {
-            content: [{
-              type: "text",
-              text: JSON.stringify({
-                result: "estimate_only",
-                legs: selected_markets.map(m => m.market_ticker),
-                leg_prices: legPrices,
-                estimated_multiplier: `${estMultiplier.toFixed(2)}x`,
-                real_multiplier: null,
-                mve: mveTicker,
-                note: `RFQ failed (${e.message}) — estimated multiplier from live leg prices.`,
-              }),
-            }],
-          };
+          return { content:[{ type:"text", text:JSON.stringify({
+            ...baseResult, result:"estimate_only",
+            mve: mveTicker,
+            note:`RFQ submit failed: ${e.message}`,
+          }) }] };
         }
 
-        // Step 3: Poll for quotes (10 seconds)
-        let bestYesBid: number | null = null;
-        let bestNoBid: number | null = null;
+        // Poll for quotes (10 seconds, path-only signing on GET)
+        let bestYesBid: number|null = null;
+        let bestNoBid: number|null = null;
         for (let i = 0; i < 10; i++) {
           await new Promise(r => setTimeout(r, 1000));
           try {
@@ -376,50 +347,35 @@ export class MyMCP extends McpAgent<Env> {
           } catch (_) {}
         }
 
-        // Step 4: Cancel RFQ
+        // Cancel RFQ
         try { await authDelete(`/communications/rfqs/${rfqId}`, kid, pk); } catch (_) {}
 
-        return {
-          content: [{
-            type: "text",
-            text: JSON.stringify({
-              result: bestYesBid !== null ? "success" : "estimate_only",
-              legs: selected_markets.map(m => m.market_ticker),
-              leg_prices: legPrices,
-              estimated_multiplier: `${estMultiplier.toFixed(2)}x`,
-              real_multiplier: bestYesBid !== null ? `${(100 / bestYesBid).toFixed(2)}x` : null,
-              yes_bid: bestYesBid,
-              no_bid: bestNoBid,
-              mve: mveTicker,
-              note: bestYesBid !== null
-                ? "Real RFQ price from live market maker. No trade placed."
-                : "No market maker active — estimated multiplier from live leg prices.",
-            }),
-          }],
-        };
-        } catch (e: any) {
-          return {
-            content: [{
-              type: "text",
-              text: JSON.stringify({
-                result: "estimate_only",
-                legs: selected_markets.map(m => m.market_ticker),
-                leg_prices: legPrices,
-                estimated_multiplier: `${estMultiplier.toFixed(2)}x`,
-                real_multiplier: null,
-                note: `Execution error — estimated multiplier from live leg prices. Detail: ${e.message}`,
-              }),
-            }],
-          };
+        if (bestYesBid !== null) {
+          baseResult.real_multiplier = `${(100 / bestYesBid).toFixed(2)}x`;
         }
+
+        return { content:[{ type:"text", text:JSON.stringify({
+          ...baseResult,
+          result: bestYesBid !== null ? "success" : "estimate_only",
+          yes_bid: bestYesBid,
+          no_bid: bestNoBid,
+          mve: mveTicker,
+          note: bestYesBid !== null
+            ? "Real RFQ price from live market maker. No trade placed."
+            : "No market maker active — estimated multiplier from live leg prices.",
+        }) }] };
       }
     );
+  }
+}
 
 export default {
   fetch(request: Request, env: Env, ctx: ExecutionContext) {
     const url = new URL(request.url);
-    if (url.pathname === "/sse" || url.pathname === "/sse/message") return MyMCP.serveSSE("/sse").fetch(request, env, ctx);
-    if (url.pathname === "/mcp") return MyMCP.serve("/mcp").fetch(request, env, ctx);
-    return new Response("Not found", { status: 404 });
+    if (url.pathname === "/sse" || url.pathname === "/sse/message")
+      return MyMCP.serveSSE("/sse").fetch(request, env, ctx);
+    if (url.pathname === "/mcp")
+      return MyMCP.serve("/mcp").fetch(request, env, ctx);
+    return new Response("Not found", { status:404 });
   },
 };
