@@ -2,8 +2,10 @@ import { McpAgent } from "agents/mcp";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
-// Primary production URL per Kalshi docs
+// Public market data endpoint
 const KALSHI_BASE = "https://external-api.kalshi.com/trade-api/v2";
+// Authenticated trading endpoint (RFQ, communications, portfolio)
+const KALSHI_AUTH_BASE = "https://api.elections.kalshi.com/trade-api/v2";
 
 const SERIES: Record<string, string[]> = {
   worldcup: [
@@ -62,21 +64,21 @@ async function pub(path: string): Promise<any> {
 
 async function authGet(path: string, kid: string, pk: CryptoKey): Promise<any> {
   const h = await makeHeaders("GET", `/trade-api/v2${path}`, kid, pk, false);
-  const r = await fetch(`${KALSHI_BASE}${path}`, { method: "GET", headers: h });
+  const r = await fetch(`${KALSHI_AUTH_BASE}${path}`, { method: "GET", headers: h });
   if (!r.ok) throw new Error(`${r.status}: ${await r.text()}`);
   return r.json();
 }
 
 async function authPost(path: string, body: unknown, kid: string, pk: CryptoKey): Promise<any> {
   const h = await makeHeaders("POST", `/trade-api/v2${path}`, kid, pk, true);
-  const r = await fetch(`${KALSHI_BASE}${path}`, { method: "POST", headers: h, body: JSON.stringify(body) });
+  const r = await fetch(`${KALSHI_AUTH_BASE}${path}`, { method: "POST", headers: h, body: JSON.stringify(body) });
   if (!r.ok) throw new Error(`${r.status}: ${await r.text()}`);
   return r.json();
 }
 
 async function authDelete(path: string, kid: string, pk: CryptoKey): Promise<void> {
   const h = await makeHeaders("DELETE", `/trade-api/v2${path}`, kid, pk, false);
-  await fetch(`${KALSHI_BASE}${path}`, { method: "DELETE", headers: h });
+  await fetch(`${KALSHI_AUTH_BASE}${path}`, { method: "DELETE", headers: h });
 }
 
 // ─── COMPACT EXTRACTOR ────────────────────────────────────────────────────────
@@ -283,7 +285,7 @@ export class MyMCP extends McpAgent<Env> {
             kid, pk, true
           );
           const mveRes = await fetch(
-            `${KALSHI_BASE}/multivariate_event_collections/${collection_ticker}`,
+            `${KALSHI_AUTH_BASE}/multivariate_event_collections/${collection_ticker}`,
             {
               method: "POST", headers: mveH,
               body: JSON.stringify({ selected_markets, with_market_payload: true }),
