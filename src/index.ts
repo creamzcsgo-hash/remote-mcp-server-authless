@@ -2,7 +2,8 @@ import { McpAgent } from "agents/mcp";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
-const KALSHI_BASE = "https://api.elections.kalshi.com/trade-api/v2";
+// Primary production URL per Kalshi docs
+const KALSHI_BASE = "https://external-api.kalshi.com/trade-api/v2";
 
 const SERIES: Record<string, string[]> = {
   worldcup: [
@@ -79,21 +80,33 @@ async function authDelete(path: string, kid: string, pk: CryptoKey): Promise<voi
 }
 
 // ─── COMPACT EXTRACTOR ────────────────────────────────────────────────────────
+// Prices come back as dollar strings e.g. "0.5600" = 56 cents = 56%
+// Convert to 0-100 integer by multiplying by 100
+
+function toInt(dollarStr: string | undefined): number {
+  if (!dollarStr) return 0;
+  return Math.round(parseFloat(dollarStr) * 100);
+}
 
 function compact(events: any[], series: string): any[] {
   const rows: any[] = [];
   for (const ev of events ?? []) {
     for (const m of ev.markets ?? []) {
-      if (m.status !== "open") continue;
+      // Market status is "active" not "open" per Kalshi API docs
+      if (m.status !== "active") continue;
+      const yb = toInt(m.yes_bid_dollars);
+      const ya = toInt(m.yes_ask_dollars);
+      const nb = toInt(m.no_bid_dollars);
+      if (yb === 0 && ya === 0) continue; // skip markets with no prices
       rows.push({
-        s: series,                          // series ticker
-        et: ev.event_ticker,               // event ticker
-        mt: m.ticker,                      // market ticker
-        t: (m.title ?? m.subtitle ?? "").substring(0, 60),
-        yb: m.yes_bid,                     // yes bid (0-100)
-        ya: m.yes_ask,
-        nb: m.no_bid,
-        vol: m.volume,
+        s: series,
+        et: ev.event_ticker,
+        mt: m.ticker,
+        t: (m.yes_sub_title ?? m.title ?? "").substring(0, 60),
+        yb,   // yes bid 0-100
+        ya,   // yes ask 0-100
+        nb,   // no bid 0-100
+        vol: m.volume_fp ?? m.volume,
       });
     }
   }
@@ -101,19 +114,19 @@ function compact(events: any[], series: string): any[] {
 }
 
 // Fetch one series with retry on 429
-async function fetchSeries(ticker: string, retries = 2): Promise<any[]> {
-  for (let i = 0; i <= retries; i++) {
+async function fetchSeries(ticker: string): Promise<any[]> {
+  for (let attempt = 0; attempt < 3; attempt++) {
     try {
       const d = await pub(
         `/events?series_ticker=${ticker}&status=open&with_nested_markets=true`
       );
       return compact(d.events ?? [], ticker);
     } catch (e: any) {
-      if (e.message.includes("429") && i < retries) {
-        await new Promise(r => setTimeout(r, 1500 * (i + 1))); // backoff
+      if (e.message.startsWith("429") && attempt < 2) {
+        await new Promise(r => setTimeout(r, 2000 * (attempt + 1)));
         continue;
       }
-      return []; // swallow error, return empty
+      return [];
     }
   }
   return [];
@@ -124,26 +137,53 @@ async function fetchSeries(ticker: string, retries = 2): Promise<any[]> {
 interface Env { KALSHI_KEY_ID: string; KALSHI_PRIVATE_KEY: string; }
 
 export class MyMCP extends McpAgent<Env> {
-  server = new McpServer({ name: "Kalshi Sports Data", version: "2.1.0" });
+  server = new McpServer({ name: "Kalshi Sports Data", version: "2.2.0" });
 
   async init() {
 
-    // PRIMARY TOOL — single call gets everything, minimal token footprint
+    // ALL SPORTS IN ONE CALL — primary daily tool
+    this.server.tool(
+      "kalshi_get_all_today",
+      "PRIMARY TOOL. Fetches ALL open active markets for World Cup + MLB + NBA in one call. Returns compact rows grouped by game. Fields: s=series, et=event_ticker, mt=market_ticker, t=title(yes side), yb=yes_bid(0-100), ya=yes_ask(0-100), nb=no_bid(0-100), vol=volume. Multiplier per leg = 100/yb.",
+      {},
+      async () => {
+        const result: Record<string, any> = {};
+        for (const sport of ["worldcup", "mlb", "nba"] as const) {
+          const byEvent: Record<string, any[]> = {};
+          for (const ticker of SERIES[sport]) {
+            const rows = await fetchSeries(ticker);
+            for (const r of rows) {
+              if (!byEvent[r.et]) byEvent[r.et] = [];
+              byEvent[r.et].push(r);
+            }
+            await new Promise(res => setTimeout(res, 150)); // pace between series
+          }
+          result[sport] = {
+            games: byEvent,
+            game_count: Object.keys(byEvent).length,
+            market_count: Object.values(byEvent).flat().length,
+          };
+        }
+        return {
+          content: [{ type: "text", text: JSON.stringify(result) }],
+        };
+      }
+    );
+
+    // SINGLE SPORT — if only one sport needed
     this.server.tool(
       "kalshi_get_today_markets",
-      "PRIMARY TOOL. Fetches ALL open markets for a sport today, server-side across all series, returns compact rows only. One call gets everything needed to build combos. Fields: s=series, et=event_ticker, mt=market_ticker, t=title, yb=yes_bid(0-100), ya=yes_ask, nb=no_bid, vol=volume. Multiplier=100/yb.",
+      "Fetch open active markets for one sport. Use kalshi_get_all_today instead when building the full daily 8-combo briefing.",
       { sport: z.enum(["worldcup", "mlb", "nba"]) },
       async ({ sport }) => {
-        const tickers = SERIES[sport];
-        // Sequential with small gap to avoid rate limits
         const byEvent: Record<string, any[]> = {};
-        for (const ticker of tickers) {
+        for (const ticker of SERIES[sport]) {
           const rows = await fetchSeries(ticker);
           for (const r of rows) {
             if (!byEvent[r.et]) byEvent[r.et] = [];
             byEvent[r.et].push(r);
           }
-          await new Promise(res => setTimeout(res, 120)); // 120ms between series
+          await new Promise(res => setTimeout(res, 150));
         }
         return {
           content: [{
@@ -151,43 +191,9 @@ export class MyMCP extends McpAgent<Env> {
             text: JSON.stringify({
               sport,
               games: byEvent,
-              total: Object.values(byEvent).flat().length,
+              game_count: Object.keys(byEvent).length,
+              market_count: Object.values(byEvent).flat().length,
             }),
-          }],
-        };
-      }
-    );
-
-    // ALL SPORTS IN ONE CALL — use for full daily briefing
-    this.server.tool(
-      "kalshi_get_all_today",
-      "Fetches ALL open markets for World Cup + MLB + NBA in one call. Use this for the daily 8-combo briefing instead of calling kalshi_get_today_markets three times.",
-      {},
-      async () => {
-        const allSports = ["worldcup", "mlb", "nba"] as const;
-        const result: Record<string, any> = {};
-
-        for (const sport of allSports) {
-          const tickers = SERIES[sport];
-          const byEvent: Record<string, any[]> = {};
-          for (const ticker of tickers) {
-            const rows = await fetchSeries(ticker);
-            for (const r of rows) {
-              if (!byEvent[r.et]) byEvent[r.et] = [];
-              byEvent[r.et].push(r);
-            }
-            await new Promise(res => setTimeout(res, 120));
-          }
-          result[sport] = {
-            games: byEvent,
-            total: Object.values(byEvent).flat().length,
-          };
-        }
-
-        return {
-          content: [{
-            type: "text",
-            text: JSON.stringify(result),
           }],
         };
       }
@@ -195,12 +201,11 @@ export class MyMCP extends McpAgent<Env> {
 
     this.server.tool(
       "kalshi_get_event",
-      "Deep dive on one specific game event. Only use when kalshi_get_today_markets data isn't enough.",
+      "Deep dive on one specific game event ticker.",
       { event_ticker: z.string() },
       async ({ event_ticker }) => {
         const data = await pub(`/events/${event_ticker}?with_nested_markets=true`);
-        const ev = data.event ?? data;
-        const markets = compact([ev], event_ticker);
+        const markets = compact([data.event ?? data], event_ticker);
         return { content: [{ type: "text", text: JSON.stringify({ event_ticker, markets }) }] };
       }
     );
@@ -225,7 +230,7 @@ export class MyMCP extends McpAgent<Env> {
 
     this.server.tool(
       "kalshi_get_combo_collections",
-      "Find combo collection tickers for a game event. Use before kalshi_get_combo_price if needed. Default fallback: KXMVESPORTSMULTIGAMEEXTENDED-R.",
+      "Find combo collection tickers for a game. Fallback: KXMVESPORTSMULTIGAMEEXTENDED-R.",
       { event_ticker: z.string() },
       async ({ event_ticker }) => {
         const data = await pub(
@@ -236,7 +241,10 @@ export class MyMCP extends McpAgent<Env> {
           content: [{
             type: "text",
             text: JSON.stringify({
-              collections: cols.map((c: any) => ({ collection_ticker: c.collection_ticker, title: c.title })),
+              collections: cols.map((c: any) => ({
+                collection_ticker: c.collection_ticker,
+                title: c.title,
+              })),
               fallback: "KXMVESPORTSMULTIGAMEEXTENDED-R",
             }),
           }],
@@ -266,7 +274,7 @@ export class MyMCP extends McpAgent<Env> {
           return { content: [{ type: "text", text: JSON.stringify({ error: "Auth failed", detail: e.message }) }] };
         }
 
-        // Step 1: Create or reuse MVE (409 = already exists, extract ticker)
+        // Step 1: Create or reuse MVE (409 = already exists)
         let mveTicker: string;
         try {
           const mveH = await makeHeaders(
@@ -276,7 +284,10 @@ export class MyMCP extends McpAgent<Env> {
           );
           const mveRes = await fetch(
             `${KALSHI_BASE}/multivariate_event_collections/${collection_ticker}`,
-            { method: "POST", headers: mveH, body: JSON.stringify({ selected_markets, with_market_payload: true }) }
+            {
+              method: "POST", headers: mveH,
+              body: JSON.stringify({ selected_markets, with_market_payload: true }),
+            }
           );
           const mveBody = await mveRes.json() as any;
           if (mveRes.status === 409) {
@@ -306,7 +317,7 @@ export class MyMCP extends McpAgent<Env> {
           return { content: [{ type: "text", text: JSON.stringify({ error: "RFQ failed", detail: e.message, mve: mveTicker }) }] };
         }
 
-        // Step 3: Poll quotes — GET uses path-only signing, no Content-Type
+        // Step 3: Poll for quotes — GET signs path only, no Content-Type
         let bestYesBid: number | null = null;
         let bestNoBid: number | null = null;
         let lastRes: unknown = null;
@@ -319,12 +330,13 @@ export class MyMCP extends McpAgent<Env> {
             );
             lastRes = qRes;
             for (const q of (qRes.quotes ?? qRes.data ?? [])) {
+              // Quotes may return dollar strings or cent integers — handle both
               const ybRaw = parseFloat(q.yes_bid_dollars ?? q.yes_price_dollars ?? "0");
-              const yb = ybRaw > 1 ? Math.round(ybRaw) : Math.round(ybRaw * 100);
+              const yb = ybRaw <= 1 ? Math.round(ybRaw * 100) : Math.round(ybRaw);
               if (yb > 0 && (bestYesBid === null || yb > bestYesBid)) {
                 bestYesBid = yb;
                 const nbRaw = parseFloat(q.no_bid_dollars ?? q.no_price_dollars ?? "0");
-                bestNoBid = nbRaw > 1 ? Math.round(nbRaw) : Math.round(nbRaw * 100);
+                bestNoBid = nbRaw <= 1 ? Math.round(nbRaw * 100) : Math.round(nbRaw);
               }
             }
             if (bestYesBid !== null) break;
@@ -344,7 +356,7 @@ export class MyMCP extends McpAgent<Env> {
                 mve: mveTicker,
                 legs: selected_markets.map(m => m.market_ticker),
                 last: lastRes,
-                note: "No market maker active yet. Present as estimated multiplier.",
+                note: "No market maker active yet. Use estimated multiplier.",
               }),
             }],
           };
