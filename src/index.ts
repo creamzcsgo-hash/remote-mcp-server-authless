@@ -16,9 +16,12 @@ const SERIES: Record<string, string[]> = {
   ],
   mlb: ["KXMLBGAME","KXMLBSPREAD","KXMLBTOTAL"],
   nba: [
-    "KXNBAGAME",     // moneyline — regular season + Summer League
-    "KXNBASPREAD",   // spread
-    "KXNBATOTAL",    // total points
+    "KXNBAGAME",           // regular season moneyline
+    "KXNBASPREAD",         // regular season spread
+    "KXNBATOTAL",          // regular season total
+    "KXNBASUMMERGAME",     // Summer League moneyline
+    "KXNBASUMMERSPREAD",   // Summer League spread
+    "KXNBASUMMERTOTAL",    // Summer League total
   ],
 };
 
