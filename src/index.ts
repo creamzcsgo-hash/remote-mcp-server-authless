@@ -15,7 +15,18 @@ const SERIES: Record<string, string[]> = {
     "KXWC1HTOTAL","KXWC1HBTTS","KXWCGOAL","KXWCCORNERS","KXWCADVANCE",
   ],
   mlb: ["KXMLBGAME","KXMLBSPREAD","KXMLBTOTAL"],
-  nba: ["KXNBAGAME"],
+  nba: [
+    "KXNBAGAME",      // moneyline (game winner)
+    "KXNBASPREAD",    // spread (point spread)
+    "KXNBATOTAL",     // total points over/under
+    "KXNBAPTS",       // player points props
+    "KXNBAREBS",      // player rebounds props
+    "KXNBAAST",       // player assists props
+    "KXNBAFTM",       // player free throws made
+    "KXNBASLGAME",    // NBA Summer League moneyline
+    "KXNBASLSPREAD",  // NBA Summer League spread
+    "KXNBASLTOTAL",   // NBA Summer League total
+  ],
 };
 
 // ── Auth ──────────────────────────────────────────────────────────────────────
