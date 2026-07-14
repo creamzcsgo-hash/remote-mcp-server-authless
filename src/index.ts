@@ -16,16 +16,9 @@ const SERIES: Record<string, string[]> = {
   ],
   mlb: ["KXMLBGAME","KXMLBSPREAD","KXMLBTOTAL"],
   nba: [
-    "KXNBAGAME",      // moneyline (game winner)
-    "KXNBASPREAD",    // spread (point spread)
-    "KXNBATOTAL",     // total points over/under
-    "KXNBAPTS",       // player points props
-    "KXNBAREBS",      // player rebounds props
-    "KXNBAAST",       // player assists props
-    "KXNBAFTM",       // player free throws made
-    "KXNBASLGAME",    // NBA Summer League moneyline
-    "KXNBASLSPREAD",  // NBA Summer League spread
-    "KXNBASLTOTAL",   // NBA Summer League total
+    "KXNBAGAME",     // moneyline — regular season + Summer League
+    "KXNBASPREAD",   // spread
+    "KXNBATOTAL",    // total points
   ],
 };
 
@@ -237,6 +230,54 @@ export class MyMCP extends McpAgent<Env> {
           .slice(0,20)
           .map((s: any) => ({ ticker:s.ticker, title:s.title }));
         return { content:[{ type:"text", text:JSON.stringify({ keyword, results:hits }) }] };
+      }
+    );
+
+    this.server.tool(
+      "kalshi_find_basketball_series",
+      "Dynamically discovers ALL currently active basketball series on Kalshi — regular season, Summer League, WNBA, player props, whatever is live right now. Use this when kalshi_get_today_markets returns empty NBA results, or to find Summer League and prop series tickers.",
+      {},
+      async () => {
+        // Search all sports series for anything basketball-related
+        const d = await pub(`/series?category=Sports&limit=1000`);
+        const all = (d as any).series ?? [];
+        const basketball = all.filter((s: any) => {
+          const title = (s.title ?? "").toLowerCase();
+          const ticker = (s.ticker ?? "").toLowerCase();
+          return (
+            ticker.includes("nba") ||
+            ticker.includes("wnba") ||
+            title.includes("basketball") ||
+            title.includes("summer league") ||
+            title.includes("nba")
+          );
+        }).map((s: any) => ({ ticker: s.ticker, title: s.title }));
+
+        // For each found series, check if it has open events today
+        const active: any[] = [];
+        const inactive: any[] = [];
+        for (const s of basketball) {
+          try {
+            const ev = await pub(
+              `/events?series_ticker=${s.ticker}&status=open&with_nested_markets=false&limit=1`
+            );
+            const count = (ev.events ?? []).length;
+            if (count > 0) {
+              active.push({ ...s, has_open_events: true });
+            } else {
+              inactive.push({ ...s, has_open_events: false });
+            }
+          } catch (_) {
+            inactive.push({ ...s, has_open_events: false });
+          }
+          await new Promise(r => setTimeout(r, 100));
+        }
+
+        return { content:[{ type:"text", text:JSON.stringify({
+          note: "Add any active tickers with open events to SERIES.nba in the connector code to include them in daily pulls.",
+          active_series_with_open_events: active,
+          inactive_series: inactive,
+        }) }] };
       }
     );
 
