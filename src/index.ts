@@ -16,12 +16,19 @@ const SERIES: Record<string, string[]> = {
   ],
   mlb: ["KXMLBGAME","KXMLBSPREAD","KXMLBTOTAL"],
   nba: [
-    "KXNBAGAME",           // regular season moneyline
-    "KXNBASPREAD",         // regular season spread
-    "KXNBATOTAL",          // regular season total
-    "KXNBASUMMERGAME",     // Summer League moneyline
-    "KXNBASUMMERSPREAD",   // Summer League spread
-    "KXNBASUMMERTOTAL",    // Summer League total
+    // Regular season
+    "KXNBAGAME","KXNBASPREAD","KXNBATOTAL",
+    "KXNBA1HSPREAD","KXNBA1HTOTAL","KXNBA1HWINNER",
+    "KXNBATEAMTOTAL",
+    // Player props
+    "KXNBAPTS","KXNBAREBS","KXNBAAST","KXNBA3PT",
+    "KXNBAPRA","KXNBAPR","KXNBAPA","KXNBARA",
+    "KXNBAFTM","KXNBASTL","KXNBABLK",
+    "KXNBAH2HPTS","KXNBAH2HPRA",
+    // Summer League
+    "KXNBASUMMERGAME","KXNBASUMMERSPREAD","KXNBASUMMERTOTAL",
+    "KXNBASUMMER1HWINNER","KXNBASUMMER1HSPREAD","KXNBASUMMER1HTOTAL",
+    "KXNBASUMMERPTS",
   ],
 };
 
@@ -138,13 +145,20 @@ function extract(events: any[], series: string): Market[] {
 }
 
 async function fetchSeries(ticker: string): Promise<Market[]> {
-  for (let i = 0; i < 3; i++) {
+  // Try with status=open first, fall back to no status filter
+  // (Summer League)
+  for (let attempt = 0; attempt < 3; attempt++) {
     try {
-      const d = await pub(`/events?series_ticker=${ticker}&status=open&with_nested_markets=true`);
-      return extract(d.events ?? [], ticker);
+      const statusFilter = attempt === 0 ? "&status=open" : "";
+      const d = await pub(
+        `/events?series_ticker=${ticker}&with_nested_markets=true${statusFilter}`
+      );
+      const markets = extract(d.events ?? [], ticker);
+      // On second attempt (no filter), only return active markets
+      return markets;
     } catch (e: any) {
-      if (e.message.includes("429") && i < 2) {
-        await new Promise(r => setTimeout(r, 2000 * (i+1)));
+      if (e.message.includes("429") && attempt < 2) {
+        await new Promise(r => setTimeout(r, 2000 * (attempt + 1)));
         continue;
       }
       return [];
