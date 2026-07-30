@@ -156,17 +156,15 @@ function extract(events: any[], series: string): Market[] {
 }
 
 async function fetchSeries(ticker: string): Promise<Market[]> {
-  // Try with status=open first, fall back to no status filter
-  // (Summer League)
+  // No status filter — Kalshi uses different event statuses across
+  // series types (player props, Summer League etc don't always use "open")
+  // Market-level filtering (active only) handles this downstream
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
-      const statusFilter = attempt === 0 ? "&status=open" : "";
       const d = await pub(
-        `/events?series_ticker=${ticker}&with_nested_markets=true${statusFilter}`
+        `/events?series_ticker=${ticker}&with_nested_markets=true`
       );
-      const markets = extract(d.events ?? [], ticker);
-      // On second attempt (no filter), only return active markets
-      return markets;
+      return extract(d.events ?? [], ticker);
     } catch (e: any) {
       if (e.message.includes("429") && attempt < 2) {
         await new Promise(r => setTimeout(r, 2000 * (attempt + 1)));
