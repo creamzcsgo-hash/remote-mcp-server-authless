@@ -14,7 +14,18 @@ const SERIES: Record<string, string[]> = {
     "KXWCBTTS","KXWCTT","KXWC1H","KXWC1HSPREAD",
     "KXWC1HTOTAL","KXWC1HBTTS","KXWCGOAL","KXWCCORNERS","KXWCADVANCE",
   ],
-  mlb: ["KXMLBGAME","KXMLBSPREAD","KXMLBTOTAL"],
+  mlb: [
+    // Game markets
+    "KXMLBGAME","KXMLBSPREAD","KXMLBTOTAL","KXMLBF5TOTAL",
+    // Player props
+    "KXMLBHR",    // Home Runs
+    "KXMLBKS",    // Strikeouts
+    "KXMLBHIT",   // Hits
+    "KXMLBHRR",   // Hits + Runs + RBIs
+    "KXMLBTB",    // Total Bases
+    "KXMLBOUTS",  // Outs Recorded
+    "KXMLBRBI",   // RBIs
+  ],
   nba: [
     // Regular season
     "KXNBAGAME","KXNBASPREAD","KXNBATOTAL",
