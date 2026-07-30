@@ -5,24 +5,18 @@ import { z } from "zod";
 const EXT  = "https://external-api.kalshi.com/trade-api/v2";
 const ELEC = "https://api.elections.kalshi.com/trade-api/v2";
 
-const SERIES: Record<string, string[]> = {
+const SERIES: Record<string, string[]> & { mlbprops: string[] } = {
   worldcup: [
     "KXWCGAME","KXWCSPREAD","KXWCTOTAL","KXWCSCORE",
     "KXWCBTTS","KXWCTT","KXWC1H","KXWC1HSPREAD",
     "KXWC1HTOTAL","KXWC1HBTTS","KXWCGOAL","KXWCCORNERS","KXWCADVANCE",
   ],
   mlb: [
-    // Game markets
     "KXMLBGAME","KXMLBSPREAD","KXMLBTOTAL","KXMLBF5TOTAL",
-    // Single-game player props (confirmed on Kalshi)
-    "KXMLBHR",    // Home Runs
-    "KXMLBKS",    // Strikeouts
-    "KXMLBHIT",   // Hits
-    "KXMLBHRR",   // Hits + Runs + RBIs
-    "KXMLBTB",    // Total Bases
-    "KXMLBOUTS",  // Outs Recorded
-    "KXMLBRBI",   // RBIs
-    "KXMLBSB",    // Stolen Bases
+  ],
+  mlbprops: [
+    "KXMLBHR","KXMLBKS","KXMLBHIT","KXMLBHRR",
+    "KXMLBTB","KXMLBOUTS","KXMLBRBI","KXMLBSB",
   ],
   nba: [
     // Inactive until Oct 2026 — add back when regular season starts
@@ -159,23 +153,62 @@ export class MyMCP extends McpAgent<Env> {
     // PRIMARY: all sports one call
     this.server.tool(
       "kalshi_get_all_today",
-      "PRIMARY TOOL. Fetches ALL open Kalshi markets for World Cup, MLB (including player props: HR, Ks, hits, HRR, total bases, outs, RBI, SB), and NBA — today and upcoming. Returns compact rows grouped by game. Fields: s=series, et=event_ticker, mt=market_ticker, t=title, yb=yes_bid(0-100), ya=yes_ask, nb=no_bid, vol=volume. Multiplier = 100/yb.",
+      "PRIMARY TOOL. Fetches ALL open Kalshi markets for World Cup, MLB (game markets + all player props: HR, Ks, hits, HRR, total bases, outs, RBI, SB), and NBA. Returns compact rows grouped by game event_ticker. Fields: s=series, et=event_ticker, mt=market_ticker, t=title, yb=yes_bid(0-100), ya=yes_ask, nb=no_bid, vol=volume. Multiplier = 100/yb.",
       {},
       async () => {
         const out: Record<string,any> = {};
-        for (const sport of ["worldcup","mlb","nba"] as const) {
-          const byGame: Record<string,Market[]> = {};
-          for (const ticker of SERIES[sport]) {
-            const rows = await fetchSeries(ticker);
-            for (const row of rows) (byGame[row.et] ??= []).push(row);
-            await new Promise(r => setTimeout(r, 150));
-          }
-          out[sport] = {
-            game_count: Object.keys(byGame).length,
-            market_count: Object.values(byGame).flat().length,
-            games: byGame,
-          };
+
+        // World Cup
+        const wcByGame: Record<string,Market[]> = {};
+        for (const ticker of SERIES.worldcup) {
+          const rows = await fetchSeries(ticker);
+          for (const row of rows) (wcByGame[row.et] ??= []).push(row);
+          await new Promise(r => setTimeout(r, 200));
         }
+        out.worldcup = {
+          game_count: Object.keys(wcByGame).length,
+          market_count: Object.values(wcByGame).flat().length,
+          games: wcByGame,
+        };
+
+        // MLB game markets first
+        const mlbByGame: Record<string,Market[]> = {};
+        for (const ticker of SERIES.mlb) {
+          const rows = await fetchSeries(ticker);
+          for (const row of rows) (mlbByGame[row.et] ??= []).push(row);
+          await new Promise(r => setTimeout(r, 200));
+        }
+
+        // MLB props — longer gap before starting to avoid 429
+        await new Promise(r => setTimeout(r, 500));
+        for (const ticker of SERIES.mlbprops) {
+          const rows = await fetchSeries(ticker);
+          for (const row of rows) {
+            // Match prop events to game events by team codes + date
+            // Props have different event_ticker format so store under prop et
+            (mlbByGame[row.et] ??= []).push(row);
+          }
+          await new Promise(r => setTimeout(r, 300));
+        }
+        out.mlb = {
+          game_count: Object.keys(mlbByGame).length,
+          market_count: Object.values(mlbByGame).flat().length,
+          games: mlbByGame,
+        };
+
+        // NBA
+        const nbaByGame: Record<string,Market[]> = {};
+        for (const ticker of SERIES.nba) {
+          const rows = await fetchSeries(ticker);
+          for (const row of rows) (nbaByGame[row.et] ??= []).push(row);
+          await new Promise(r => setTimeout(r, 200));
+        }
+        out.nba = {
+          game_count: Object.keys(nbaByGame).length,
+          market_count: Object.values(nbaByGame).flat().length,
+          games: nbaByGame,
+        };
+
         return { content:[{ type:"text", text:JSON.stringify(out) }] };
       }
     );
