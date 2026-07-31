@@ -5,25 +5,13 @@ import { z } from "zod";
 const EXT  = "https://external-api.kalshi.com/trade-api/v2";
 const ELEC = "https://api.elections.kalshi.com/trade-api/v2";
 
-const SERIES: Record<string, string[]> & { mlbprops: string[] } = {
-  worldcup: [
-    "KXWCGAME","KXWCSPREAD","KXWCTOTAL","KXWCSCORE",
-    "KXWCBTTS","KXWCTT","KXWC1H","KXWC1HSPREAD",
-    "KXWC1HTOTAL","KXWC1HBTTS","KXWCGOAL","KXWCCORNERS","KXWCADVANCE",
-  ],
-  mlb: [
-    "KXMLBGAME","KXMLBSPREAD","KXMLBTOTAL","KXMLBF5TOTAL",
-  ],
-  mlbprops: [
-    "KXMLBHR","KXMLBKS","KXMLBHIT","KXMLBHRR",
-    "KXMLBTB","KXMLBOUTS","KXMLBRBI","KXMLBSB",
-  ],
-  nba: [
-    // Inactive until Oct 2026 — add back when regular season starts
-    "KXNBAGAME","KXNBASPREAD","KXNBATOTAL",
-    "KXNBASUMMERGAME","KXNBASUMMERSPREAD","KXNBASUMMERTOTAL",
-  ],
-};
+// Sport tag — only MLB and NBA
+function sportTag(series: string): string | null {
+  const t = series.toUpperCase();
+  if (t.startsWith("KXMLB")) return "mlb";
+  if (t.startsWith("KXNBA")) return "nba";
+  return null;
+}
 
 // ── Auth ──────────────────────────────────────────────────────────────────────
 
@@ -89,7 +77,7 @@ async function aDEL_ext(path: string, kid: string, pk: CryptoKey): Promise<void>
   await fetch(`${EXT}${path}`, { method:"DELETE", headers:h });
 }
 
-// ── Price + extraction ────────────────────────────────────────────────────────
+// ── Price helpers ─────────────────────────────────────────────────────────────
 
 function toCents(s: string|undefined): number {
   if (!s) return 0;
@@ -98,47 +86,43 @@ function toCents(s: string|undefined): number {
   return Math.round(v < 1.01 ? v * 100 : v);
 }
 
-interface Market {
-  s: string; et: string; mt: string; t: string;
-  yb: number; ya: number; nb: number; vol: number;
-}
+// ── Fetch all active markets, paginated, filtered to MLB+NBA ──────────────────
 
-function extract(events: any[], series: string): Market[] {
-  const out: Market[] = [];
-  for (const ev of events ?? []) {
-    for (const m of ev.markets ?? []) {
-      if (m.status !== "active") continue;
+async function fetchAllMarkets(): Promise<Record<string, Record<string, any[]>>> {
+  const out: Record<string, Record<string, any[]>> = { mlb:{}, nba:{} };
+  let cursor = "";
+  let pages = 0;
+
+  while (pages < 10) {
+    const cursorParam = cursor ? `&cursor=${cursor}` : "";
+    const data = await pub(`/markets?status=active&limit=1000${cursorParam}`);
+    const markets: any[] = data.markets ?? [];
+
+    for (const m of markets) {
+      const sport = sportTag(m.series_ticker ?? "");
+      if (!sport) continue;
       const yb = toCents(m.yes_bid_dollars);
       const ya = toCents(m.yes_ask_dollars);
       const nb = toCents(m.no_bid_dollars);
       if (yb === 0 && ya === 0 && nb === 0) continue;
-      out.push({
-        s: series, et: ev.event_ticker, mt: m.ticker,
+      const et = m.event_ticker ?? m.series_ticker;
+      if (!out[sport][et]) out[sport][et] = [];
+      out[sport][et].push({
+        s: m.series_ticker,
+        et,
+        mt: m.ticker,
         t: (m.yes_sub_title ?? m.title ?? "").slice(0,70),
         yb, ya, nb,
         vol: Math.round(parseFloat(String(m.volume_fp ?? m.volume ?? 0))),
       });
     }
-  }
-  return out;
-}
 
-// No status filter — props/summer league use different event statuses
-// Market-level active filter handles quality control downstream
-async function fetchSeries(ticker: string): Promise<Market[]> {
-  for (let i = 0; i < 3; i++) {
-    try {
-      const d = await pub(`/events?series_ticker=${ticker}&with_nested_markets=true`);
-      return extract(d.events ?? [], ticker);
-    } catch (e: any) {
-      if (e.message.includes("429") && i < 2) {
-        await new Promise(r => setTimeout(r, 2000 * (i+1)));
-        continue;
-      }
-      return [];
-    }
+    cursor = data.cursor ?? "";
+    pages++;
+    if (!cursor || markets.length < 1000) break;
   }
-  return [];
+
+  return out;
 }
 
 // ── Agent ─────────────────────────────────────────────────────────────────────
@@ -146,121 +130,93 @@ async function fetchSeries(ticker: string): Promise<Market[]> {
 interface Env { KALSHI_KEY_ID: string; KALSHI_PRIVATE_KEY: string; }
 
 export class MyMCP extends McpAgent<Env> {
-  server = new McpServer({ name:"Kalshi Sports Connector", version:"3.2.0" });
+  server = new McpServer({ name:"Kalshi Sports Connector", version:"5.0.0" });
 
   async init() {
 
-    // PRIMARY: all sports one call
+    // PRIMARY — all MLB + NBA in 1-2 API calls
     this.server.tool(
       "kalshi_get_all_today",
-      "PRIMARY TOOL. Fetches ALL open Kalshi markets for World Cup, MLB (game markets + all player props: HR, Ks, hits, HRR, total bases, outs, RBI, SB), and NBA. Returns compact rows grouped by game event_ticker. Fields: s=series, et=event_ticker, mt=market_ticker, t=title, yb=yes_bid(0-100), ya=yes_ask, nb=no_bid, vol=volume. Multiplier = 100/yb.",
+      "PRIMARY TOOL. Fetches ALL active Kalshi markets for MLB and NBA (including Summer League) in 1-2 API calls. Includes game markets (moneyline, spread, total, F5 total) AND all player props (HR, strikeouts, hits, HRR, total bases, outs recorded, RBI, stolen bases for MLB; points, rebounds, assists, 3PT, FTM for NBA). Grouped by sport then game event_ticker. Fields: mt=market_ticker, et=event_ticker, s=series, t=title, yb=yes_bid(0-100), ya=yes_ask, nb=no_bid, vol=volume. Multiplier = 100/yb.",
       {},
       async () => {
-        const out: Record<string,any> = {};
-
-        // World Cup
-        const wcByGame: Record<string,Market[]> = {};
-        for (const ticker of SERIES.worldcup) {
-          const rows = await fetchSeries(ticker);
-          for (const row of rows) (wcByGame[row.et] ??= []).push(row);
-          await new Promise(r => setTimeout(r, 200));
+        const markets = await fetchAllMarkets();
+        const summary: Record<string,any> = {};
+        for (const [sport, games] of Object.entries(markets)) {
+          const gc = Object.keys(games).length;
+          const mc = Object.values(games).flat().length;
+          if (gc === 0) continue;
+          summary[sport] = { game_count:gc, market_count:mc, games };
         }
-        out.worldcup = {
-          game_count: Object.keys(wcByGame).length,
-          market_count: Object.values(wcByGame).flat().length,
-          games: wcByGame,
-        };
-
-        // MLB game markets first
-        const mlbByGame: Record<string,Market[]> = {};
-        for (const ticker of SERIES.mlb) {
-          const rows = await fetchSeries(ticker);
-          for (const row of rows) (mlbByGame[row.et] ??= []).push(row);
-          await new Promise(r => setTimeout(r, 200));
-        }
-
-        // MLB props — longer gap before starting to avoid 429
-        await new Promise(r => setTimeout(r, 500));
-        for (const ticker of SERIES.mlbprops) {
-          const rows = await fetchSeries(ticker);
-          for (const row of rows) {
-            // Match prop events to game events by team codes + date
-            // Props have different event_ticker format so store under prop et
-            (mlbByGame[row.et] ??= []).push(row);
-          }
-          await new Promise(r => setTimeout(r, 300));
-        }
-        out.mlb = {
-          game_count: Object.keys(mlbByGame).length,
-          market_count: Object.values(mlbByGame).flat().length,
-          games: mlbByGame,
-        };
-
-        // NBA
-        const nbaByGame: Record<string,Market[]> = {};
-        for (const ticker of SERIES.nba) {
-          const rows = await fetchSeries(ticker);
-          for (const row of rows) (nbaByGame[row.et] ??= []).push(row);
-          await new Promise(r => setTimeout(r, 200));
-        }
-        out.nba = {
-          game_count: Object.keys(nbaByGame).length,
-          market_count: Object.values(nbaByGame).flat().length,
-          games: nbaByGame,
-        };
-
-        return { content:[{ type:"text", text:JSON.stringify(out) }] };
+        return { content:[{ type:"text", text:JSON.stringify(summary) }] };
       }
     );
 
     // SINGLE SPORT
     this.server.tool(
       "kalshi_get_today_markets",
-      "Fetch all open markets for one sport only. Use kalshi_get_all_today for full daily briefing.",
-      { sport: z.enum(["worldcup","mlb","nba"]) },
+      "Fetch all active markets for one sport (MLB or NBA). Use kalshi_get_all_today for both at once.",
+      { sport: z.enum(["mlb","nba"]) },
       async ({ sport }) => {
-        const byGame: Record<string,Market[]> = {};
-        for (const ticker of SERIES[sport]) {
-          const rows = await fetchSeries(ticker);
-          for (const row of rows) (byGame[row.et] ??= []).push(row);
-          await new Promise(r => setTimeout(r, 150));
-        }
+        const all = await fetchAllMarkets();
+        const games = all[sport] ?? {};
         return { content:[{ type:"text", text:JSON.stringify({
           sport,
-          game_count: Object.keys(byGame).length,
-          market_count: Object.values(byGame).flat().length,
-          games: byGame,
+          game_count: Object.keys(games).length,
+          market_count: Object.values(games).flat().length,
+          games,
         }) }] };
       }
     );
 
-    // SINGLE EVENT
+    // SINGLE GAME
     this.server.tool(
       "kalshi_get_event",
       "Get all markets for one specific game by event_ticker.",
       { event_ticker: z.string() },
       async ({ event_ticker }) => {
-        const d = await pub(`/events/${event_ticker}?with_nested_markets=true`);
-        return { content:[{ type:"text", text:JSON.stringify({
-          event_ticker,
-          markets: extract([d.event ?? d], event_ticker),
-        }) }] };
+        const data = await pub(`/events/${event_ticker}?with_nested_markets=true`);
+        const ev = data.event ?? data;
+        const markets: any[] = [];
+        for (const m of ev.markets ?? []) {
+          if (m.status !== "active") continue;
+          const yb = toCents(m.yes_bid_dollars);
+          const ya = toCents(m.yes_ask_dollars);
+          const nb = toCents(m.no_bid_dollars);
+          markets.push({
+            mt:m.ticker, et:event_ticker, s:m.series_ticker ?? "",
+            t:(m.yes_sub_title ?? m.title ?? "").slice(0,70),
+            yb, ya, nb,
+            vol:Math.round(parseFloat(String(m.volume_fp ?? m.volume ?? 0))),
+          });
+        }
+        return { content:[{ type:"text", text:JSON.stringify({ event_ticker, markets }) }] };
       }
     );
 
-    // SERIES LOOKUP — see what's actually under any series ticker
+    // SERIES LOOKUP
     this.server.tool(
       "kalshi_get_series_events",
-      "Get all events and markets under any Kalshi series ticker. Use to verify what's live under prop series like KXMLBHR, KXMLBKS, KXMLBHIT etc.",
+      "Get all events and markets under any Kalshi series ticker (e.g. KXMLBHR, KXMLBKS, KXNBAPTS).",
       { series_ticker: z.string() },
       async ({ series_ticker }) => {
-        const d = await pub(`/events?series_ticker=${series_ticker}&with_nested_markets=true`);
-        const markets = extract(d.events ?? [], series_ticker);
+        const data = await pub(`/events?series_ticker=${series_ticker}&with_nested_markets=true`);
+        const markets: any[] = [];
+        for (const ev of data.events ?? []) {
+          for (const m of ev.markets ?? []) {
+            if (m.status !== "active") continue;
+            markets.push({
+              mt:m.ticker, et:ev.event_ticker,
+              t:(m.yes_sub_title ?? m.title ?? "").slice(0,70),
+              yb:toCents(m.yes_bid_dollars),
+              ya:toCents(m.yes_ask_dollars),
+              nb:toCents(m.no_bid_dollars),
+              vol:Math.round(parseFloat(String(m.volume_fp ?? m.volume ?? 0))),
+            });
+          }
+        }
         return { content:[{ type:"text", text:JSON.stringify({
-          series_ticker,
-          event_count: (d.events ?? []).length,
-          market_count: markets.length,
-          markets,
+          series_ticker, market_count:markets.length, markets
         }) }] };
       }
     );
@@ -268,12 +224,12 @@ export class MyMCP extends McpAgent<Env> {
     // SERIES SEARCH
     this.server.tool(
       "kalshi_search_series",
-      "Search for any Kalshi sports series ticker by keyword.",
+      "Search Kalshi sports series by keyword to find any prop or market type.",
       { keyword: z.string() },
       async ({ keyword }) => {
-        const d = await pub(`/series?category=Sports&limit=1000`);
+        const data = await pub(`/series?category=Sports&limit=1000`);
         const kw = keyword.toLowerCase();
-        const hits = ((d as any).series ?? [])
+        const hits = ((data as any).series ?? [])
           .filter((s: any) =>
             (s.title ?? "").toLowerCase().includes(kw) ||
             (s.ticker ?? "").toLowerCase().includes(kw)
@@ -287,22 +243,22 @@ export class MyMCP extends McpAgent<Env> {
     // COMBO COLLECTIONS
     this.server.tool(
       "kalshi_get_combo_collections",
-      "Find combo collection tickers for a game event. Fallback: KXMVESPORTSMULTIGAMEEXTENDED-R.",
+      "Find combo collection tickers for a game. Default: KXMVESPORTSMULTIGAMEEXTENDED-R.",
       { event_ticker: z.string() },
       async ({ event_ticker }) => {
-        const d = await pub(`/multivariate_event_collections?event_ticker=${event_ticker}&status=open`);
-        const cols = (d as any).multivariate_contracts ?? [];
+        const data = await pub(`/multivariate_event_collections?event_ticker=${event_ticker}&status=open`);
+        const cols = (data as any).multivariate_contracts ?? [];
         return { content:[{ type:"text", text:JSON.stringify({
-          collections: cols.map((c: any) => ({ collection_ticker:c.collection_ticker, title:c.title })),
-          fallback: "KXMVESPORTSMULTIGAMEEXTENDED-R",
+          collections:cols.map((c: any) => ({ collection_ticker:c.collection_ticker, title:c.title })),
+          fallback:"KXMVESPORTSMULTIGAMEEXTENDED-R",
         }) }] };
       }
     );
 
-    // COMBO PRICE — estimated always, real RFQ when market makers active
+    // COMBO PRICE
     this.server.tool(
       "kalshi_get_combo_price",
-      "Gets the combo multiplier. Always returns estimated_multiplier from live yb prices instantly. Also submits live RFQ — returns real_multiplier if market maker responds. Pass yb from board data for each leg. RFQ cancelled after, no trade placed.",
+      "Gets combo multiplier. Always returns estimated_multiplier from live yb prices. Submits RFQ for real market-maker quote if active. Pass yb from board data. RFQ cancelled after — no trade placed.",
       {
         collection_ticker: z.string().default("KXMVESPORTSMULTIGAMEEXTENDED-R"),
         legs: z.array(z.object({
@@ -314,9 +270,8 @@ export class MyMCP extends McpAgent<Env> {
         contracts: z.number().int().min(1).max(100).default(1),
       },
       async ({ collection_ticker, legs, contracts }) => {
-
         const prices = legs.map(l => l.side === "no" ? 100 - l.yb : l.yb);
-        const estMult = prices.reduce((a, p) => a * (100 / p), 1).toFixed(2);
+        const estMult = prices.reduce((a,p) => a * (100/p), 1).toFixed(2);
         const base = {
           legs: legs.map(l => ({ mt:l.market_ticker, side:l.side, yb:l.yb })),
           prices,
@@ -330,11 +285,11 @@ export class MyMCP extends McpAgent<Env> {
           pk = await importKey(this.env.KALSHI_PRIVATE_KEY);
         } catch (e: any) {
           return { content:[{ type:"text", text:JSON.stringify({
-            ...base, result:"estimate_only", note:`Auth failed: ${e.message}`
+            ...base, result:"estimate_only", note:`Auth: ${e.message}`
           }) }] };
         }
 
-        // MVE creation — api.elections.kalshi.com
+        // MVE
         let mveTicker: string;
         try {
           const path = `/multivariate_event_collections/${collection_ticker}`;
@@ -342,31 +297,31 @@ export class MyMCP extends McpAgent<Env> {
           const r = await fetch(`${ELEC}${path}`, {
             method:"POST", headers:h,
             body:JSON.stringify({
-              selected_markets: legs.map(l => ({
+              selected_markets:legs.map(l => ({
                 market_ticker:l.market_ticker,
                 event_ticker:l.event_ticker,
                 side:l.side,
               })),
-              with_market_payload: true,
+              with_market_payload:true,
             }),
           });
           const b = await r.json() as any;
           if (r.status === 409) {
             mveTicker = b.market_ticker ?? b.ticker ?? b.data?.market_ticker;
-            if (!mveTicker) throw new Error(`409 no ticker: ${JSON.stringify(b)}`);
+            if (!mveTicker) throw new Error("409 no ticker");
           } else if (r.ok) {
             mveTicker = b.market_ticker ?? b.ticker;
-            if (!mveTicker) throw new Error(`No ticker: ${JSON.stringify(b)}`);
+            if (!mveTicker) throw new Error("No ticker");
           } else {
             throw new Error(`${r.status}: ${JSON.stringify(b)}`);
           }
         } catch (e: any) {
           return { content:[{ type:"text", text:JSON.stringify({
-            ...base, result:"estimate_only", note:`MVE failed: ${e.message}`
+            ...base, result:"estimate_only", note:`MVE: ${e.message}`
           }) }] };
         }
 
-        // RFQ — external-api.kalshi.com
+        // RFQ
         let rfqId: string;
         try {
           const res = await aPOST_ext(
@@ -378,12 +333,11 @@ export class MyMCP extends McpAgent<Env> {
           if (!rfqId) throw new Error("No ID: " + JSON.stringify(res));
         } catch (e: any) {
           return { content:[{ type:"text", text:JSON.stringify({
-            ...base, result:"estimate_only", mve:mveTicker,
-            note:`RFQ failed: ${e.message}`
+            ...base, result:"estimate_only", mve:mveTicker, note:`RFQ: ${e.message}`
           }) }] };
         }
 
-        // Poll quotes — api.elections.kalshi.com, path-only signing
+        // Poll quotes
         let bestBid: number|null = null;
         let bestNoBid: number|null = null;
         for (let i = 0; i < 10; i++) {
@@ -395,71 +349,60 @@ export class MyMCP extends McpAgent<Env> {
             );
             for (const q of (qr.quotes ?? qr.data ?? [])) {
               const raw = parseFloat(q.yes_bid_dollars ?? q.yes_price_dollars ?? "0");
-              const yb = raw < 1.01 ? Math.round(raw * 100) : Math.round(raw);
+              const yb = raw < 1.01 ? Math.round(raw*100) : Math.round(raw);
               if (yb > 0 && (bestBid === null || yb > bestBid)) {
                 bestBid = yb;
                 const nr = parseFloat(q.no_bid_dollars ?? q.no_price_dollars ?? "0");
-                bestNoBid = nr < 1.01 ? Math.round(nr * 100) : Math.round(nr);
+                bestNoBid = nr < 1.01 ? Math.round(nr*100) : Math.round(nr);
               }
             }
             if (bestBid !== null) break;
           } catch (_) {}
         }
 
-        // Cancel RFQ
         try { await aDEL_ext(`/communications/rfqs/${rfqId}`, kid, pk); } catch (_) {}
 
         if (bestBid !== null) {
           return { content:[{ type:"text", text:JSON.stringify({
-            ...base,
-            result: "success",
-            real_multiplier: `${(100 / bestBid).toFixed(2)}x`,
-            real_yes_bid: bestBid,
-            real_no_bid: bestNoBid,
-            mve: mveTicker,
-            note: "Real RFQ price. No trade placed.",
+            ...base, result:"success",
+            real_multiplier:`${(100/bestBid).toFixed(2)}x`,
+            real_yes_bid:bestBid, real_no_bid:bestNoBid,
+            mve:mveTicker, note:"Real RFQ price. No trade placed.",
           }) }] };
         }
 
         return { content:[{ type:"text", text:JSON.stringify({
-          ...base,
-          result: "estimate_only",
-          mve: mveTicker,
-          rfq_id: rfqId,
-          note: "No market maker response — estimated multiplier from live Kalshi prices.",
+          ...base, result:"estimate_only", mve:mveTicker,
+          note:"No market maker response — estimated multiplier from live prices.",
         }) }] };
       }
     );
 
-    // BASKETBALL SERIES DISCOVERY
+    // BASKETBALL DISCOVERY
     this.server.tool(
       "kalshi_find_basketball_series",
-      "Discovers all basketball series on Kalshi with open events. Use when NBA/Summer League shows empty.",
+      "Discovers all active NBA/Summer League series on Kalshi with open events.",
       {},
       async () => {
-        const d = await pub(`/series?category=Sports&limit=1000`);
-        const all = (d as any).series ?? [];
-        const basketball = all.filter((s: any) => {
-          const title = (s.title ?? "").toLowerCase();
-          const ticker = (s.ticker ?? "").toLowerCase();
-          return ticker.includes("nba") || ticker.includes("wnba") ||
-            title.includes("basketball") || title.includes("summer league");
+        const data = await pub(`/series?category=Sports&limit=1000`);
+        const all = (data as any).series ?? [];
+        const bball = all.filter((s: any) => {
+          const t = (s.ticker ?? "").toUpperCase();
+          return t.startsWith("KXNBA");
         }).map((s: any) => ({ ticker:s.ticker, title:s.title }));
 
-        const active: any[] = [];
-        const inactive: any[] = [];
-        for (const s of basketball) {
+        const active: any[] = [], inactive: any[] = [];
+        for (const s of bball) {
           try {
-            const ev = await pub(`/events?series_ticker=${s.ticker}&with_nested_markets=false&limit=1`);
-            if ((ev.events ?? []).length > 0) active.push({ ...s, has_open_events:true });
-            else inactive.push({ ...s, has_open_events:false });
-          } catch (_) { inactive.push({ ...s, has_open_events:false }); }
-          await new Promise(r => setTimeout(r, 100));
+            const ev = await pub(`/events?series_ticker=${s.ticker}&limit=1`);
+            if ((ev.events ?? []).length > 0) active.push(s);
+            else inactive.push(s);
+          } catch (_) { inactive.push(s); }
+          await new Promise(r => setTimeout(r, 150));
         }
-
         return { content:[{ type:"text", text:JSON.stringify({
-          active_series_with_open_events: active,
-          inactive_series: inactive,
+          active_series_with_open_events:active,
+          inactive_series:inactive,
         }) }] };
       }
     );
@@ -473,6 +416,6 @@ export default {
       return MyMCP.serveSSE("/sse").fetch(request, env, ctx);
     if (url.pathname === "/mcp")
       return MyMCP.serve("/mcp").fetch(request, env, ctx);
-    return new Response("Kalshi Sports Connector v3.2", { status:200 });
+    return new Response("Kalshi Sports Connector v5.0", { status:200 });
   },
 };
