@@ -95,9 +95,26 @@ async function fetchAllMarkets(): Promise<Record<string, Record<string, any[]>>>
 
   while (pages < 10) {
     const cursorParam = cursor ? `&cursor=${cursor}` : "";
-    const data = await pub(`/markets?status=active&limit=1000${cursorParam}`);
-    const markets: any[] = data.markets ?? [];
+    let data: any;
+    let retries = 0;
 
+    while (retries < 3) {
+      try {
+        data = await pub(`/markets?status=active&limit=1000${cursorParam}`);
+        break;
+      } catch (e: any) {
+        if (e.message.includes("429")) {
+          retries++;
+          // Back off hard — don't hammer a rate-limited API
+          await new Promise(r => setTimeout(r, 8000 * retries));
+          if (retries >= 3) throw new Error("RATE_LIMITED: Kalshi API quota exhausted. Wait 30-60 minutes before trying again.");
+        } else {
+          throw e;
+        }
+      }
+    }
+
+    const markets: any[] = data.markets ?? [];
     for (const m of markets) {
       const sport = sportTag(m.series_ticker ?? "");
       if (!sport) continue;
@@ -108,9 +125,7 @@ async function fetchAllMarkets(): Promise<Record<string, Record<string, any[]>>>
       const et = m.event_ticker ?? m.series_ticker;
       if (!out[sport][et]) out[sport][et] = [];
       out[sport][et].push({
-        s: m.series_ticker,
-        et,
-        mt: m.ticker,
+        s: m.series_ticker, et, mt: m.ticker,
         t: (m.yes_sub_title ?? m.title ?? "").slice(0,70),
         yb, ya, nb,
         vol: Math.round(parseFloat(String(m.volume_fp ?? m.volume ?? 0))),
@@ -120,10 +135,12 @@ async function fetchAllMarkets(): Promise<Record<string, Record<string, any[]>>>
     cursor = data.cursor ?? "";
     pages++;
     if (!cursor || markets.length < 1000) break;
+    // Small pause between pages to avoid hitting rate limit mid-fetch
+    await new Promise(r => setTimeout(r, 300));
   }
 
   return out;
-}
+        }
 
 // ── Agent ─────────────────────────────────────────────────────────────────────
 
