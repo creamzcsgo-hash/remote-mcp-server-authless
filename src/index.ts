@@ -86,11 +86,15 @@ const delay = (ms: number) => new Promise(r => setTimeout(r, ms));
 async function fetchSeries(ticker: string, dateFilter?: string): Promise<Record<string, any[]>> {
   const byGame: Record<string, any[]> = {};
   try {
-    const d = await pub(`/events?series_ticker=${ticker}&status=open&with_nested_markets=true&limit=200`);
-    for (const ev of d.events ?? []) {
-      const et: string = ev.event_ticker ?? "";
-      if (dateFilter && !et.includes(dateFilter.toUpperCase())) continue;
-      for (const m of ev.markets ?? []) {
+    // Use /markets endpoint directly — this returns prices, /events nested markets does not
+    let cursor = "";
+    for (let page = 0; page < 5; page++) {
+      const cp = cursor ? `&cursor=${cursor}` : "";
+      const d = await pub(`/markets?series_ticker=${ticker}&limit=200${cp}`);
+      const markets: any[] = d.markets ?? [];
+      for (const m of markets) {
+        const et: string = m.event_ticker ?? "";
+        if (dateFilter && !et.includes(dateFilter.toUpperCase())) continue;
         const yb = toCents(m.yes_bid_dollars);
         const ya = toCents(m.yes_ask_dollars);
         const nb = toCents(m.no_bid_dollars);
@@ -100,9 +104,12 @@ async function fetchSeries(ticker: string, dateFilter?: string): Promise<Record<
           s: ticker, et, mt: m.ticker,
           t: (m.yes_sub_title ?? m.title ?? "").slice(0, 70),
           yb, ya, nb,
-          vol: Math.round(parseFloat(String(m.volume_fp ?? m.volume ?? 0))),
+          vol: Math.round(parseFloat(String(m.open_interest_fp ?? m.volume ?? 0))),
         });
       }
+      cursor = d.cursor ?? "";
+      if (!cursor || markets.length < 200) break;
+      await delay(200);
     }
   // If event came back with no nested markets, fetch it directly
     for (const ev of d.events ?? []) {
