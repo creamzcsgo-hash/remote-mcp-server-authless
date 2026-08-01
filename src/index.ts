@@ -131,7 +131,7 @@ export class MyMCP extends McpAgent<Env> {
   async init() {
 
     // PRIMARY TOOL
-    this.server.tool(
+   this.server.tool(
       "kalshi_get_all_today",
       "PRIMARY TOOL. Fetches all active Kalshi markets for MLB and NBA including game markets (ML, spread, total, F5) and player props (HR, strikeouts, hits, HRR, total bases, outs, RBI, SB). Returns markets grouped by game. Fields: mt=market_ticker, et=event_ticker, s=series, t=title, yb=yes_bid(0-100), ya=yes_ask, nb=no_bid, vol=volume. Multiplier = 100/yb.",
       {},
@@ -139,17 +139,16 @@ export class MyMCP extends McpAgent<Env> {
         const mlbByGame: Record<string,any[]> = {};
         const nbaByGame: Record<string,any[]> = {};
 
-        for (const ticker of MLB_SERIES) {
-          const rows = await fetchSeries(ticker);
-          for (const r of rows) (mlbByGame[r.et] ??= []).push(r);
-          await delay(150);
-        }
+        // Fetch all series in parallel — one burst instead of 18 sequential calls
+        const [mlbResults, nbaResults] = await Promise.all([
+          Promise.all(MLB_SERIES.map(t => fetchSeries(t))),
+          Promise.all(NBA_SERIES.map(t => fetchSeries(t))),
+        ]);
 
-        for (const ticker of NBA_SERIES) {
-          const rows = await fetchSeries(ticker);
-          for (const r of rows) (nbaByGame[r.et] ??= []).push(r);
-          await delay(150);
-        }
+        for (const rows of mlbResults)
+          for (const r of rows) if (!r.error) (mlbByGame[r.et] ??= []).push(r);
+        for (const rows of nbaResults)
+          for (const r of rows) if (!r.error) (nbaByGame[r.et] ??= []).push(r);
 
         const out: Record<string,any> = {};
         if (Object.keys(mlbByGame).length > 0) out.mlb = {
@@ -164,11 +163,7 @@ export class MyMCP extends McpAgent<Env> {
         };
 
         return { content:[{ type:"text", text:JSON.stringify(
-          Object.keys(out).length > 0 ? out : {
-            note:"No markets found.",
-            errors: [...Object.values(mlbByGame).flat(), ...Object.values(nbaByGame).flat()]
-              .filter((r: any) => r.error)
-          }
+          Object.keys(out).length > 0 ? out : { note:"No active markets found yet." }
         ) }] };
       }
     );
@@ -181,11 +176,9 @@ export class MyMCP extends McpAgent<Env> {
       async ({ sport }) => {
         const series = sport === "mlb" ? MLB_SERIES : NBA_SERIES;
         const byGame: Record<string,any[]> = {};
-        for (const ticker of series) {
-          const rows = await fetchSeries(ticker);
-          for (const r of rows) (byGame[r.et] ??= []).push(r);
-          await delay(150);
-        }
+        const results = await Promise.all(series.map(t => fetchSeries(t)));
+        for (const rows of results)
+          for (const r of rows) if (!r.error) (byGame[r.et] ??= []).push(r);
         return { content:[{ type:"text", text:JSON.stringify({
           sport,
           game_count: Object.keys(byGame).length,
