@@ -4,6 +4,8 @@ import { z } from "zod";
 
 const EXT  = "https://external-api.kalshi.com/trade-api/v2";
 const ELEC = "https://api.elections.kalshi.com/trade-api/v2";
+const CACHE_URL = "https://kalshi-cache.internal/markets";
+const CACHE_TTL = 300; // 5 minutes
 
 const MLB_SERIES = [
   "KXMLBGAME","KXMLBSPREAD","KXMLBTOTAL","KXMLBF5TOTAL",
@@ -26,7 +28,7 @@ async function importKey(pem: string): Promise<CryptoKey> {
     .replace(/-----END [A-Z ]+-----/g,"")
     .replace(/\s+/g,"");
   if (!/^[A-Za-z0-9+/]+=*$/.test(body))
-    throw new Error(`Key body malformed. Starts: "${body.slice(0,30)}"`);
+    throw new Error(`Key malformed. Starts: "${body.slice(0,30)}"`);
   const der = Uint8Array.from(atob(body), c => c.charCodeAt(0));
   return crypto.subtle.importKey(
     "pkcs8", der, { name:"RSA-PSS", hash:"SHA-256" }, false, ["sign"]
@@ -93,21 +95,59 @@ function toCents(s: string|undefined): number {
 
 const delay = (ms: number) => new Promise(r => setTimeout(r, ms));
 
-// ONE call per series — no event discovery step needed
-async function fetchBySeries(seriesList: string[]): Promise<Record<string,any[]>> {
-  const byGame: Record<string,any[]> = {};
-  for (const series of seriesList) {
+// ── Cache ─────────────────────────────────────────────────────────────────────
+
+async function getCached(): Promise<Record<string,any> | null> {
+  try {
+    const cache = caches.default;
+    const res = await cache.match(new Request(CACHE_URL));
+    if (!res) return null;
+    return await res.json();
+  } catch { return null; }
+}
+
+async function setCache(data: Record<string,any>): Promise<void> {
+  try {
+    const cache = caches.default;
+    const res = new Response(JSON.stringify(data), {
+      headers: {
+        "Content-Type": "application/json",
+        "Cache-Control": `public, max-age=${CACHE_TTL}`,
+      },
+    });
+    await cache.put(new Request(CACHE_URL), res);
+  } catch { /* cache write failure is non-fatal */ }
+}
+
+async function clearCache(): Promise<void> {
+  try {
+    const cache = caches.default;
+    await cache.delete(new Request(CACHE_URL));
+  } catch { /* non-fatal */ }
+}
+
+// ── Market fetch (only called when cache is cold) ─────────────────────────────
+
+async function fetchFresh(): Promise<Record<string,any>> {
+  const out: Record<string,Record<string,any[]>> = { mlb:{}, nba:{} };
+
+  const allSeries = [
+    ...MLB_SERIES.map(s => ({ s, sport:"mlb" })),
+    ...NBA_SERIES.map(s => ({ s, sport:"nba" })),
+  ];
+
+  for (const { s, sport } of allSeries) {
     try {
-      const d = await pub(`/markets?series_ticker=${series}&status=active&limit=500`);
+      const d = await pub(`/markets?series_ticker=${s}&status=active&limit=500`);
       for (const m of d.markets ?? []) {
         const yb = toCents(m.yes_bid_dollars);
         const ya = toCents(m.yes_ask_dollars);
         const nb = toCents(m.no_bid_dollars);
         if (yb === 0 && ya === 0 && nb === 0) continue;
-        const et = m.event_ticker ?? series;
-        if (!byGame[et]) byGame[et] = [];
-        byGame[et].push({
-          s: series, et, mt: m.ticker,
+        const et = m.event_ticker ?? s;
+        if (!out[sport][et]) out[sport][et] = [];
+        out[sport][et].push({
+          s, et, mt: m.ticker,
           t: (m.yes_sub_title ?? m.title ?? "").slice(0,70),
           yb, ya, nb,
           vol: Math.round(parseFloat(String(m.volume_fp ?? m.volume ?? 0))),
@@ -115,11 +155,22 @@ async function fetchBySeries(seriesList: string[]): Promise<Record<string,any[]>
       }
     } catch (e: any) {
       if (e.message === "RATE_LIMITED") throw e;
-      // skip series on other errors
+      // skip this series, keep going
     }
-    await delay(300); // 300ms gap = max ~3 calls/sec, well within limits
+    await delay(400); // conservative 400ms gap = 2.5 req/sec, well under 20/sec limit
   }
-  return byGame;
+
+  const summary: Record<string,any> = {};
+  for (const [sport, games] of Object.entries(out)) {
+    const gc = Object.keys(games).length;
+    if (gc === 0) continue;
+    summary[sport] = {
+      game_count: gc,
+      market_count: Object.values(games).flat().length,
+      games,
+    };
+  }
+  return summary;
 }
 
 // ── Agent ─────────────────────────────────────────────────────────────────────
@@ -127,52 +178,61 @@ async function fetchBySeries(seriesList: string[]): Promise<Record<string,any[]>
 interface Env { KALSHI_KEY_ID: string; KALSHI_PRIVATE_KEY: string; }
 
 export class MyMCP extends McpAgent<Env> {
-  server = new McpServer({ name:"Kalshi Sports Connector", version:"7.0.0" });
+  server = new McpServer({ name:"Kalshi Sports Connector", version:"8.0.0" });
 
   async init() {
 
+    // PRIMARY — uses cache, only hits Kalshi API once per 5 minutes
     this.server.tool(
       "kalshi_get_all_today",
-      "PRIMARY TOOL. Fetches ALL active Kalshi markets for MLB and NBA including all player props (HR, strikeouts, hits, HRR, total bases, outs recorded, RBI, stolen bases). Makes one API call per series with 300ms gaps — no rate limiting. Returns markets grouped by sport and game event_ticker. Fields: mt=market_ticker, et=event_ticker, s=series, t=title, yb=yes_bid(0-100), ya=yes_ask, nb=no_bid, vol=volume. Multiplier = 100/yb.",
-      {},
-      async () => {
+      "PRIMARY TOOL. Returns all active MLB and NBA markets including all player props (HR, strikeouts, hits, HRR, total bases, outs, RBI, SB). Results are cached for 5 minutes — only the first call per session hits the Kalshi API. Subsequent calls (e.g. during combo pricing) return instantly from cache. Fields: mt=market_ticker, et=event_ticker, s=series, t=title, yb=yes_bid(0-100), ya=yes_ask, nb=no_bid, vol=volume. Multiplier = 100/yb.",
+      { refresh: z.boolean().default(false).describe("Set true to force-refresh the cache") },
+      async ({ refresh }) => {
         try {
-          const mlb = await fetchBySeries(MLB_SERIES);
-          const nba = await fetchBySeries(NBA_SERIES);
-          const out: Record<string,any> = {};
-          if (Object.keys(mlb).length > 0) out.mlb = {
-            game_count: Object.keys(mlb).length,
-            market_count: Object.values(mlb).flat().length,
-            games: mlb,
-          };
-          if (Object.keys(nba).length > 0) out.nba = {
-            game_count: Object.keys(nba).length,
-            market_count: Object.values(nba).flat().length,
-            games: nba,
-          };
-          if (Object.keys(out).length === 0) return { content:[{ type:"text", text:JSON.stringify({
-            result:"no_markets",
-            note:"No active MLB or NBA markets found. Markets may not have opened yet for today.",
-          }) }] };
-          return { content:[{ type:"text", text:JSON.stringify(out) }] };
+          if (refresh) await clearCache();
+
+          const cached = await getCached();
+          if (cached) {
+            return { content:[{ type:"text", text:JSON.stringify({ ...cached, _cache:"hit" }) }] };
+          }
+
+          const fresh = await fetchFresh();
+          await setCache(fresh);
+
+          if (Object.keys(fresh).length === 0) {
+            return { content:[{ type:"text", text:JSON.stringify({
+              result:"no_markets",
+              note:"No active MLB or NBA markets found. Markets may not have opened yet.",
+            }) }] };
+          }
+
+          return { content:[{ type:"text", text:JSON.stringify({ ...fresh, _cache:"miss" }) }] };
+
         } catch (e: any) {
-          if (e.message === "RATE_LIMITED") return { content:[{ type:"text", text:JSON.stringify({
-            result:"rate_limited",
-            note:"Kalshi API rate limited. Stop all tool calls and wait 30 minutes.",
-          }) }] };
+          if (e.message === "RATE_LIMITED") {
+            return { content:[{ type:"text", text:JSON.stringify({
+              result:"rate_limited",
+              note:"Kalshi API rate limited. Stop all tool calls. Wait 30 minutes then try again in a fresh chat.",
+            }) }] };
+          }
           throw e;
         }
       }
     );
 
+    // SINGLE SPORT — also uses cache
     this.server.tool(
       "kalshi_get_today_markets",
-      "Fetch active markets for one sport only. Use kalshi_get_all_today for both.",
+      "Returns active markets for one sport. Reads from cache if available.",
       { sport: z.enum(["mlb","nba"]) },
       async ({ sport }) => {
         try {
-          const series = sport === "mlb" ? MLB_SERIES : NBA_SERIES;
-          const games = await fetchBySeries(series);
+          let data = await getCached();
+          if (!data) {
+            data = await fetchFresh();
+            await setCache(data);
+          }
+          const games = data[sport]?.games ?? {};
           return { content:[{ type:"text", text:JSON.stringify({
             sport,
             game_count: Object.keys(games).length,
@@ -188,9 +248,10 @@ export class MyMCP extends McpAgent<Env> {
       }
     );
 
+    // SINGLE GAME — direct API call, one request only
     this.server.tool(
       "kalshi_get_event",
-      "Get all markets for one specific game by event_ticker.",
+      "Get all markets for one specific game by event_ticker. Makes one API call.",
       { event_ticker: z.string() },
       async ({ event_ticker }) => {
         const d = await pub(`/markets?event_ticker=${event_ticker}&status=active&limit=500`);
@@ -201,21 +262,20 @@ export class MyMCP extends McpAgent<Env> {
           const nb = toCents(m.no_bid_dollars);
           if (yb === 0 && ya === 0 && nb === 0) continue;
           markets.push({
-            s: m.series_ticker ?? "", et: event_ticker, mt: m.ticker,
-            t: (m.yes_sub_title ?? m.title ?? "").slice(0,70),
+            s:m.series_ticker??"", et:event_ticker, mt:m.ticker,
+            t:(m.yes_sub_title??m.title??"").slice(0,70),
             yb, ya, nb,
-            vol: Math.round(parseFloat(String(m.volume_fp ?? m.volume ?? 0))),
+            vol:Math.round(parseFloat(String(m.volume_fp??m.volume??0))),
           });
         }
-        return { content:[{ type:"text", text:JSON.stringify({
-          event_ticker, market_count:markets.length, markets
-        }) }] };
+        return { content:[{ type:"text", text:JSON.stringify({ event_ticker, market_count:markets.length, markets }) }] };
       }
     );
 
+    // SERIES LOOKUP — one API call
     this.server.tool(
       "kalshi_get_series_events",
-      "Get all markets under any Kalshi series ticker (e.g. KXMLBHR, KXMLBKS, KXNBAPTS).",
+      "Get all active markets under any Kalshi series ticker (e.g. KXMLBHR, KXMLBKS). One API call.",
       { series_ticker: z.string() },
       async ({ series_ticker }) => {
         const d = await pub(`/markets?series_ticker=${series_ticker}&status=active&limit=500`);
@@ -226,29 +286,28 @@ export class MyMCP extends McpAgent<Env> {
           const nb = toCents(m.no_bid_dollars);
           if (yb === 0 && ya === 0 && nb === 0) continue;
           markets.push({
-            et: m.event_ticker ?? series_ticker, mt: m.ticker,
-            t: (m.yes_sub_title ?? m.title ?? "").slice(0,70),
+            et:m.event_ticker??series_ticker, mt:m.ticker,
+            t:(m.yes_sub_title??m.title??"").slice(0,70),
             yb, ya, nb,
-            vol: Math.round(parseFloat(String(m.volume_fp ?? m.volume ?? 0))),
+            vol:Math.round(parseFloat(String(m.volume_fp??m.volume??0))),
           });
         }
-        return { content:[{ type:"text", text:JSON.stringify({
-          series_ticker, market_count:markets.length, markets
-        }) }] };
+        return { content:[{ type:"text", text:JSON.stringify({ series_ticker, market_count:markets.length, markets }) }] };
       }
     );
 
+    // SERIES SEARCH
     this.server.tool(
       "kalshi_search_series",
-      "Search Kalshi sports series by keyword to find any prop or market type.",
+      "Search Kalshi sports series by keyword.",
       { keyword: z.string() },
       async ({ keyword }) => {
         const data = await pub(`/series?category=Sports&limit=1000`);
         const kw = keyword.toLowerCase();
         const hits = ((data as any).series ?? [])
           .filter((s: any) =>
-            (s.title ?? "").toLowerCase().includes(kw) ||
-            (s.ticker ?? "").toLowerCase().includes(kw)
+            (s.title??"").toLowerCase().includes(kw) ||
+            (s.ticker??"").toLowerCase().includes(kw)
           )
           .slice(0,20)
           .map((s: any) => ({ ticker:s.ticker, title:s.title }));
@@ -256,6 +315,7 @@ export class MyMCP extends McpAgent<Env> {
       }
     );
 
+    // COMBO COLLECTIONS
     this.server.tool(
       "kalshi_get_combo_collections",
       "Find combo collection tickers for a game. Default: KXMVESPORTSMULTIGAMEEXTENDED-R.",
@@ -270,9 +330,10 @@ export class MyMCP extends McpAgent<Env> {
       }
     );
 
+    // COMBO PRICE
     this.server.tool(
       "kalshi_get_combo_price",
-      "Gets combo multiplier from live leg prices. Submits RFQ for real market-maker quote when active. Pass yb from board data. RFQ cancelled after — no trade placed.",
+      "Gets combo multiplier. Always returns estimated_multiplier from live yb prices. Also submits RFQ for real market-maker quote when active. Pass yb from board data. RFQ cancelled after — no trade placed.",
       {
         collection_ticker: z.string().default("KXMVESPORTSMULTIGAMEEXTENDED-R"),
         legs: z.array(z.object({
@@ -382,6 +443,7 @@ export class MyMCP extends McpAgent<Env> {
       }
     );
 
+    // BASKETBALL DISCOVERY
     this.server.tool(
       "kalshi_find_basketball_series",
       "Discovers all active NBA/Summer League series on Kalshi with open events.",
@@ -389,16 +451,16 @@ export class MyMCP extends McpAgent<Env> {
       async () => {
         const data = await pub(`/series?category=Sports&limit=1000`);
         const bball = ((data as any).series ?? [])
-          .filter((s: any) => (s.ticker ?? "").toUpperCase().startsWith("KXNBA"))
+          .filter((s: any) => (s.ticker??"").toUpperCase().startsWith("KXNBA"))
           .map((s: any) => ({ ticker:s.ticker, title:s.title }));
         const active: any[] = [], inactive: any[] = [];
         for (const s of bball) {
           try {
             const d = await pub(`/markets?series_ticker=${s.ticker}&status=active&limit=1`);
-            if ((d.markets ?? []).length > 0) active.push(s);
+            if ((d.markets??[]).length > 0) active.push(s);
             else inactive.push(s);
           } catch (_) { inactive.push(s); }
-          await delay(200);
+          await delay(300);
         }
         return { content:[{ type:"text", text:JSON.stringify({
           active_series_with_open_events:active, inactive_series:inactive,
@@ -415,6 +477,6 @@ export default {
       return MyMCP.serveSSE("/sse").fetch(request, env, ctx);
     if (url.pathname === "/mcp")
       return MyMCP.serve("/mcp").fetch(request, env, ctx);
-    return new Response("Kalshi Sports Connector v7.0", { status:200 });
+    return new Response("Kalshi Sports Connector v8.0", { status:200 });
   },
 };
