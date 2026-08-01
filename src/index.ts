@@ -86,7 +86,7 @@ const delay = (ms: number) => new Promise(r => setTimeout(r, ms));
 async function fetchSeries(ticker: string, dateFilter?: string): Promise<Record<string, any[]>> {
   const byGame: Record<string, any[]> = {};
   try {
-    const d = await pub(`/events?series_ticker=${ticker}&status=open&with_nested_markets=true`);
+    const d = await pub(`/events?series_ticker=${ticker}&status=open&with_nested_markets=true&limit=200`);
     for (const ev of d.events ?? []) {
       const et: string = ev.event_ticker ?? "";
       if (dateFilter && !et.includes(dateFilter.toUpperCase())) continue;
@@ -103,6 +103,28 @@ async function fetchSeries(ticker: string, dateFilter?: string): Promise<Record<
           vol: Math.round(parseFloat(String(m.volume_fp ?? m.volume ?? 0))),
         });
       }
+    }
+  // If event came back with no nested markets, fetch it directly
+    for (const ev of d.events ?? []) {
+      const et: string = ev.event_ticker ?? "";
+      if (dateFilter && !et.includes(dateFilter.toUpperCase())) continue;
+      if (byGame[et]) continue; // already got markets for this event
+      try {
+        const evData = await pub(`/events/${et}?with_nested_markets=true`);
+        for (const m of (evData.event ?? evData).markets ?? []) {
+          const yb = toCents(m.yes_bid_dollars);
+          const ya = toCents(m.yes_ask_dollars);
+          const nb = toCents(m.no_bid_dollars);
+          if (yb === 0 && ya === 0 && nb === 0) continue;
+          (byGame[et] ??= []).push({
+            s: ticker, et, mt: m.ticker,
+            t: (m.yes_sub_title ?? m.title ?? "").slice(0, 70),
+            yb, ya, nb,
+            vol: Math.round(parseFloat(String(m.volume_fp ?? m.volume ?? 0))),
+          });
+        }
+        await delay(200);
+      } catch { /* skip */ }
     }
   } catch { /* skip on error */ }
   return byGame;
