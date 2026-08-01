@@ -129,35 +129,43 @@ async function clearCache(): Promise<void> {
 // ── Market fetch (only called when cache is cold) ─────────────────────────────
 
 async function fetchFresh(): Promise<Record<string,any>> {
+  // Single API call gets ALL active sports markets at once
+  // No per-series looping = no rate limit risk
   const out: Record<string,Record<string,any[]>> = { mlb:{}, nba:{} };
 
-  const allSeries = [
-    ...MLB_SERIES.map(s => ({ s, sport:"mlb" })),
-    ...NBA_SERIES.map(s => ({ s, sport:"nba" })),
-  ];
+  let cursor = "";
+  let pages = 0;
 
-  for (const { s, sport } of allSeries) {
-    try {
-      const d = await pub(`/markets?series_ticker=${s}&status=active&limit=500`);
-      for (const m of d.markets ?? []) {
-        const yb = toCents(m.yes_bid_dollars);
-        const ya = toCents(m.yes_ask_dollars);
-        const nb = toCents(m.no_bid_dollars);
-        if (yb === 0 && ya === 0 && nb === 0) continue;
-        const et = m.event_ticker ?? s;
-        if (!out[sport][et]) out[sport][et] = [];
-        out[sport][et].push({
-          s, et, mt: m.ticker,
-          t: (m.yes_sub_title ?? m.title ?? "").slice(0,70),
-          yb, ya, nb,
-          vol: Math.round(parseFloat(String(m.volume_fp ?? m.volume ?? 0))),
-        });
-      }
-    } catch (e: any) {
-      if (e.message === "RATE_LIMITED") throw e;
-      // skip this series, keep going
+  while (pages < 5) {
+    const cp = cursor ? `&cursor=${cursor}` : "";
+    const d = await pub(`/markets?status=active&category=Sports&limit=1000${cp}`);
+
+    for (const m of d.markets ?? []) {
+      const s: string = m.series_ticker ?? "";
+      let sport = "";
+      if (s.startsWith("KXMLB")) sport = "mlb";
+      else if (s.startsWith("KXNBA")) sport = "nba";
+      else continue;
+
+      const yb = toCents(m.yes_bid_dollars);
+      const ya = toCents(m.yes_ask_dollars);
+      const nb = toCents(m.no_bid_dollars);
+      if (yb === 0 && ya === 0 && nb === 0) continue;
+
+      const et = m.event_ticker ?? s;
+      if (!out[sport][et]) out[sport][et] = [];
+      out[sport][et].push({
+        s, et, mt: m.ticker,
+        t: (m.yes_sub_title ?? m.title ?? "").slice(0, 70),
+        yb, ya, nb,
+        vol: Math.round(parseFloat(String(m.volume_fp ?? m.volume ?? 0))),
+      });
     }
-    await delay(400); // conservative 400ms gap = 2.5 req/sec, well under 20/sec limit
+
+    cursor = d.cursor ?? "";
+    pages++;
+    if (!cursor || (d.markets ?? []).length < 1000) break;
+    await delay(500);
   }
 
   const summary: Record<string,any> = {};
