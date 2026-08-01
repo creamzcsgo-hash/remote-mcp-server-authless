@@ -88,7 +88,8 @@ const delay = (ms: number) => new Promise(r => setTimeout(r, ms));
 async function fetchSeries(ticker: string): Promise<Record<string,any[]>> {
   const byGame: Record<string,any[]> = {};
   try {
-    const d = await pub(`/events?series_ticker=${ticker}&with_nested_markets=true`);
+    // Fetch with status=open to get only live/upcoming markets
+    const d = await pub(`/events?series_ticker=${ticker}&status=open&with_nested_markets=true`);
     for (const ev of d.events ?? []) {
       for (const m of ev.markets ?? []) {
         const yb = toCents(m.yes_bid_dollars);
@@ -100,6 +101,7 @@ async function fetchSeries(ticker: string): Promise<Record<string,any[]>> {
         byGame[et].push({
           s: ticker, et, mt: m.ticker,
           t: (m.yes_sub_title ?? m.title ?? "").slice(0,70),
+          date: ev.sub_title ?? "",
           yb, ya, nb,
           vol: Math.round(parseFloat(String(m.volume_fp ?? m.volume ?? 0))),
         });
@@ -131,7 +133,7 @@ export class MyMCP extends McpAgent<Env> {
     // PRIMARY — only 4 MLB + 4 NBA calls, sequential with 300ms gaps
     this.server.tool(
       "kalshi_get_all_today",
-      "PRIMARY TOOL. Fetches all active Kalshi game markets for MLB (moneyline, spread, total, F5) and NBA (moneyline, spread, total). Returns markets grouped by game. Use kalshi_get_game_props to add player props for specific games. Fields: mt=market_ticker, et=event_ticker, s=series, t=title, yb=yes_bid(0-100), ya=yes_ask, nb=no_bid, vol=volume. Multiplier = 100/yb.",
+      "PRIMARY TOOL. Fetches all open Kalshi game markets for MLB and NBA — today and upcoming games. Returns markets grouped by game event_ticker with date in the 'date' field. Use kalshi_get_game_props to add player props for specific games.",
       {},
       async () => {
         const mlb: Record<string,any[]> = {};
