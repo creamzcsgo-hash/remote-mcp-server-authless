@@ -5,15 +5,11 @@ import { z } from "zod";
 const EXT  = "https://external-api.kalshi.com/trade-api/v2";
 const ELEC = "https://api.elections.kalshi.com/trade-api/v2";
 
-const MLB_SERIES = [
-  "KXMLBGAME","KXMLBSPREAD","KXMLBTOTAL","KXMLBF5TOTAL",
-  "KXMLBHR","KXMLBKS","KXMLBHIT","KXMLBHRR",
-  "KXMLBTB","KXMLBOUTS","KXMLBRBI","KXMLBSB",
-];
-const NBA_SERIES = [
-  "KXNBAGAME","KXNBASPREAD","KXNBATOTAL",
-  "KXNBASUMMERGAME","KXNBASUMMERSPREAD","KXNBASUMMERTOTAL",
-];
+// Only fetch main game series upfront — 4 calls total for MLB, 2 for NBA
+// Props fetched on-demand per game via kalshi_get_game_props
+const MLB_GAME_SERIES = ["KXMLBGAME","KXMLBSPREAD","KXMLBTOTAL","KXMLBF5TOTAL"];
+const NBA_GAME_SERIES = ["KXNBAGAME","KXNBASPREAD","KXNBATOTAL","KXNBASUMMERGAME"];
+const MLB_PROP_SERIES = ["KXMLBHR","KXMLBKS","KXMLBHIT","KXMLBHRR","KXMLBTB","KXMLBOUTS","KXMLBRBI","KXMLBSB"];
 
 // ── Auth ──────────────────────────────────────────────────────────────────────
 
@@ -77,7 +73,7 @@ async function aDEL_ext(path: string, kid: string, pk: CryptoKey): Promise<void>
   await fetch(`${EXT}${path}`, { method:"DELETE", headers:h });
 }
 
-// ── Price helper ──────────────────────────────────────────────────────────────
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
 function toCents(s: string|undefined): number {
   if (!s) return 0;
@@ -88,36 +84,38 @@ function toCents(s: string|undefined): number {
 
 const delay = (ms: number) => new Promise(r => setTimeout(r, ms));
 
-// ── Fetch one series — returns compact market rows ────────────────────────────
-
-async function fetchSeries(ticker: string): Promise<any[]> {
+// Fetch one series using events endpoint — returns all nested markets in ONE call
+async function fetchSeries(ticker: string): Promise<Record<string,any[]>> {
+  const byGame: Record<string,any[]> = {};
   try {
-    const d = await pub(`/markets?series_ticker=${ticker}&limit=500`);
-    const rows: any[] = [];
-    for (const m of d.markets ?? []) {
-      // Accept any market with valid prices — don't filter by status
-      // since Kalshi uses different status values across market types
-      const yb = toCents(m.yes_bid_dollars);
-      const ya = toCents(m.yes_ask_dollars);
-      const nb = toCents(m.no_bid_dollars);
-      if (yb === 0 && ya === 0 && nb === 0) continue;
-      // Skip settled/closed markets
-      const s = (m.status ?? "").toLowerCase();
-      if (s === "settled" || s === "finalized" || s === "determined") continue;
-      rows.push({
-        s: ticker,
-        et: m.event_ticker ?? ticker,
-        mt: m.ticker,
-        t: (m.yes_sub_title ?? m.title ?? "").slice(0,70),
-        yb, ya, nb,
-        status: m.status,
-        vol: Math.round(parseFloat(String(m.volume_fp ?? m.volume ?? 0))),
-      });
+    const d = await pub(`/events?series_ticker=${ticker}&with_nested_markets=true`);
+    for (const ev of d.events ?? []) {
+      for (const m of ev.markets ?? []) {
+        const yb = toCents(m.yes_bid_dollars);
+        const ya = toCents(m.yes_ask_dollars);
+        const nb = toCents(m.no_bid_dollars);
+        if (yb === 0 && ya === 0 && nb === 0) continue;
+        const et = ev.event_ticker;
+        if (!byGame[et]) byGame[et] = [];
+        byGame[et].push({
+          s: ticker, et, mt: m.ticker,
+          t: (m.yes_sub_title ?? m.title ?? "").slice(0,70),
+          yb, ya, nb,
+          vol: Math.round(parseFloat(String(m.volume_fp ?? m.volume ?? 0))),
+        });
+      }
     }
-    return rows;
-  } catch (e: any) {
-    // Return error info instead of silently returning empty
-    return [{ error: e.message, series: ticker }];
+  } catch { /* skip on error */ }
+  return byGame;
+}
+
+// Merge game maps together
+function mergeGames(
+  target: Record<string,any[]>,
+  source: Record<string,any[]>
+) {
+  for (const [et, markets] of Object.entries(source)) {
+    (target[et] ??= []).push(...markets);
   }
 }
 
@@ -126,99 +124,133 @@ async function fetchSeries(ticker: string): Promise<any[]> {
 interface Env { KALSHI_KEY_ID: string; KALSHI_PRIVATE_KEY: string; }
 
 export class MyMCP extends McpAgent<Env> {
-  server = new McpServer({ name:"Kalshi Sports Connector", version:"10.0.0" });
+  server = new McpServer({ name:"Kalshi Sports Connector", version:"11.0.0" });
 
   async init() {
 
-    // PRIMARY TOOL
-   this.server.tool(
+    // PRIMARY — only 4 MLB + 4 NBA calls, sequential with 300ms gaps
+    this.server.tool(
       "kalshi_get_all_today",
-      "PRIMARY TOOL. Fetches all active Kalshi markets for MLB and NBA including game markets (ML, spread, total, F5) and player props (HR, strikeouts, hits, HRR, total bases, outs, RBI, SB). Returns markets grouped by game. Fields: mt=market_ticker, et=event_ticker, s=series, t=title, yb=yes_bid(0-100), ya=yes_ask, nb=no_bid, vol=volume. Multiplier = 100/yb.",
+      "PRIMARY TOOL. Fetches all active Kalshi game markets for MLB (moneyline, spread, total, F5) and NBA (moneyline, spread, total). Returns markets grouped by game. Use kalshi_get_game_props to add player props for specific games. Fields: mt=market_ticker, et=event_ticker, s=series, t=title, yb=yes_bid(0-100), ya=yes_ask, nb=no_bid, vol=volume. Multiplier = 100/yb.",
       {},
       async () => {
-        const mlbByGame: Record<string,any[]> = {};
-        const nbaByGame: Record<string,any[]> = {};
+        const mlb: Record<string,any[]> = {};
+        const nba: Record<string,any[]> = {};
 
-        // Fetch all series in parallel — one burst instead of 18 sequential calls
-        const [mlbResults, nbaResults] = await Promise.all([
-          Promise.all(MLB_SERIES.map(t => fetchSeries(t))),
-          Promise.all(NBA_SERIES.map(t => fetchSeries(t))),
-        ]);
-
-        for (const rows of mlbResults)
-          for (const r of rows) if (!r.error) (mlbByGame[r.et] ??= []).push(r);
-        for (const rows of nbaResults)
-          for (const r of rows) if (!r.error) (nbaByGame[r.et] ??= []).push(r);
+        for (const ticker of MLB_GAME_SERIES) {
+          mergeGames(mlb, await fetchSeries(ticker));
+          await delay(300);
+        }
+        for (const ticker of NBA_GAME_SERIES) {
+          mergeGames(nba, await fetchSeries(ticker));
+          await delay(300);
+        }
 
         const out: Record<string,any> = {};
-        if (Object.keys(mlbByGame).length > 0) out.mlb = {
-          game_count: Object.keys(mlbByGame).length,
-          market_count: Object.values(mlbByGame).flat().length,
-          games: mlbByGame,
+        if (Object.keys(mlb).length > 0) out.mlb = {
+          game_count: Object.keys(mlb).length,
+          market_count: Object.values(mlb).flat().length,
+          games: mlb,
         };
-        if (Object.keys(nbaByGame).length > 0) out.nba = {
-          game_count: Object.keys(nbaByGame).length,
-          market_count: Object.values(nbaByGame).flat().length,
-          games: nbaByGame,
+        if (Object.keys(nba).length > 0) out.nba = {
+          game_count: Object.keys(nba).length,
+          market_count: Object.values(nba).flat().length,
+          games: nba,
         };
 
         return { content:[{ type:"text", text:JSON.stringify(
-          Object.keys(out).length > 0 ? out : { note:"No active markets found yet." }
+          Object.keys(out).length > 0 ? out : { note:"No markets found yet — check back closer to game time." }
         ) }] };
       }
     );
 
-    // SINGLE SPORT
+    // PROPS FOR A SPECIFIC GAME — fetches all 8 prop series for one game only
     this.server.tool(
-      "kalshi_get_today_markets",
-      "Fetch active markets for MLB or NBA only.",
-      { sport: z.enum(["mlb","nba"]) },
-      async ({ sport }) => {
-        const series = sport === "mlb" ? MLB_SERIES : NBA_SERIES;
-        const byGame: Record<string,any[]> = {};
-        const results = await Promise.all(series.map(t => fetchSeries(t)));
-        for (const rows of results)
-          for (const r of rows) if (!r.error) (byGame[r.et] ??= []).push(r);
+      "kalshi_get_game_props",
+      "Fetch all player props (HR, strikeouts, hits, HRR, total bases, outs recorded, RBI, stolen bases) for one specific MLB game. Pass the team code portion of the event_ticker (e.g. 'NYYBOS' from 'KXMLBGAME-26AUG01NYYBOS'). Makes 8 API calls — one per prop series.",
+      { game_code: z.string().describe("Team code + date portion e.g. '26AUG01NYYBOS'") },
+      async ({ game_code }) => {
+        const allProps: any[] = [];
+        for (const series of MLB_PROP_SERIES) {
+          try {
+            const d = await pub(`/events?series_ticker=${series}&with_nested_markets=true`);
+            for (const ev of d.events ?? []) {
+              // Match by game code in event ticker
+              if (!ev.event_ticker.includes(game_code.toUpperCase())) continue;
+              for (const m of ev.markets ?? []) {
+                const yb = toCents(m.yes_bid_dollars);
+                const ya = toCents(m.yes_ask_dollars);
+                const nb = toCents(m.no_bid_dollars);
+                if (yb === 0 && ya === 0 && nb === 0) continue;
+                allProps.push({
+                  s: series, et: ev.event_ticker, mt: m.ticker,
+                  t: (m.yes_sub_title ?? m.title ?? "").slice(0,70),
+                  yb, ya, nb,
+                  vol: Math.round(parseFloat(String(m.volume_fp ?? m.volume ?? 0))),
+                });
+              }
+            }
+          } catch { /* skip */ }
+          await delay(300);
+        }
         return { content:[{ type:"text", text:JSON.stringify({
-          sport,
-          game_count: Object.keys(byGame).length,
-          market_count: Object.values(byGame).flat().length,
-          games: byGame,
+          game_code,
+          prop_count: allProps.length,
+          props: allProps,
         }) }] };
       }
     );
 
-    // SINGLE GAME
+    // SINGLE GAME — all markets for one event
     this.server.tool(
       "kalshi_get_event",
       "Get all markets for one specific game by event_ticker.",
       { event_ticker: z.string() },
       async ({ event_ticker }) => {
-        const d = await pub(`/markets?event_ticker=${event_ticker}&limit=500`);
+        const d = await pub(`/events/${event_ticker}?with_nested_markets=true`);
+        const ev = d.event ?? d;
         const markets: any[] = [];
-        for (const m of d.markets ?? []) {
-          if (m.status !== "active") continue;
+        for (const m of ev.markets ?? []) {
           const yb = toCents(m.yes_bid_dollars);
           const ya = toCents(m.yes_ask_dollars);
           const nb = toCents(m.no_bid_dollars);
           if (yb === 0 && ya === 0 && nb === 0) continue;
           markets.push({
-            s:m.series_ticker??"", et:event_ticker, mt:m.ticker,
-            t:(m.yes_sub_title??m.title??"").slice(0,70),
+            s: m.series_ticker ?? "", et: event_ticker, mt: m.ticker,
+            t: (m.yes_sub_title ?? m.title ?? "").slice(0,70),
             yb, ya, nb,
-            vol:Math.round(parseFloat(String(m.volume_fp??m.volume??0))),
+            vol: Math.round(parseFloat(String(m.volume_fp ?? m.volume ?? 0))),
           });
         }
         return { content:[{ type:"text", text:JSON.stringify({
-          event_ticker, market_count:markets.length, markets
+          event_ticker, market_count: markets.length, markets
         }) }] };
+      }
+    );
+
+    // SERIES SEARCH
+    this.server.tool(
+      "kalshi_search_series",
+      "Search Kalshi sports series by keyword.",
+      { keyword: z.string() },
+      async ({ keyword }) => {
+        const data = await pub(`/series?category=Sports&limit=1000`);
+        const kw = keyword.toLowerCase();
+        const hits = ((data as any).series ?? [])
+          .filter((s: any) =>
+            (s.title??"").toLowerCase().includes(kw) ||
+            (s.ticker??"").toLowerCase().includes(kw)
+          )
+          .slice(0,20)
+          .map((s: any) => ({ ticker:s.ticker, title:s.title }));
+        return { content:[{ type:"text", text:JSON.stringify({ keyword, results:hits }) }] };
       }
     );
 
     // COMBO PRICE
     this.server.tool(
       "kalshi_get_combo_price",
-      "Gets combo multiplier. Always returns estimated_multiplier from live yb prices instantly. Also attempts live RFQ for real market-maker quote. Pass yb from board data for each leg. RFQ cancelled after — no trade placed.",
+      "Gets combo multiplier. Always returns estimated_multiplier from live yb prices. Also attempts live RFQ for real market-maker quote. Pass yb from board data. RFQ cancelled after — no trade placed.",
       {
         collection_ticker: z.string().default("KXMVESPORTSMULTIGAMEEXTENDED-R"),
         legs: z.array(z.object({
@@ -234,22 +266,17 @@ export class MyMCP extends McpAgent<Env> {
         const estMult = prices.reduce((a,p) => a*(100/p), 1).toFixed(2);
         const base = {
           legs: legs.map(l => ({ mt:l.market_ticker, side:l.side, yb:l.yb })),
-          prices,
-          estimated_multiplier: `${estMult}x`,
-          real_multiplier: null as string|null,
+          prices, estimated_multiplier:`${estMult}x`, real_multiplier:null as string|null,
         };
 
         let kid: string, pk: CryptoKey;
         try {
           kid = this.env.KALSHI_KEY_ID;
           pk = await importKey(this.env.KALSHI_PRIVATE_KEY);
-        } catch (e: any) {
-          return { content:[{ type:"text", text:JSON.stringify({
-            ...base, result:"estimate_only"
-          }) }] };
+        } catch {
+          return { content:[{ type:"text", text:JSON.stringify({ ...base, result:"estimate_only" }) }] };
         }
 
-        // MVE
         let mveTicker: string;
         try {
           const path = `/multivariate_event_collections/${collection_ticker}`;
@@ -272,13 +299,10 @@ export class MyMCP extends McpAgent<Env> {
             mveTicker = b.market_ticker ?? b.ticker;
           } else throw new Error(`${r.status}`);
           if (!mveTicker!) throw new Error("no ticker");
-        } catch (e: any) {
-          return { content:[{ type:"text", text:JSON.stringify({
-            ...base, result:"estimate_only"
-          }) }] };
+        } catch {
+          return { content:[{ type:"text", text:JSON.stringify({ ...base, result:"estimate_only" }) }] };
         }
 
-        // RFQ
         let rfqId: string;
         try {
           const res = await aPOST_ext(
@@ -289,12 +313,9 @@ export class MyMCP extends McpAgent<Env> {
           rfqId = res.id ?? res.rfq?.rfq_id ?? res.rfq_id;
           if (!rfqId) throw new Error("no id");
         } catch {
-          return { content:[{ type:"text", text:JSON.stringify({
-            ...base, result:"estimate_only", mve:mveTicker
-          }) }] };
+          return { content:[{ type:"text", text:JSON.stringify({ ...base, result:"estimate_only", mve:mveTicker }) }] };
         }
 
-        // Poll quotes
         let bestBid: number|null = null;
         let bestNoBid: number|null = null;
         for (let i = 0; i < 10; i++) {
@@ -329,25 +350,6 @@ export class MyMCP extends McpAgent<Env> {
         }) }] };
       }
     );
-
-    // SERIES SEARCH
-    this.server.tool(
-      "kalshi_search_series",
-      "Search Kalshi sports series by keyword.",
-      { keyword: z.string() },
-      async ({ keyword }) => {
-        const data = await pub(`/series?category=Sports&limit=1000`);
-        const kw = keyword.toLowerCase();
-        const hits = ((data as any).series ?? [])
-          .filter((s: any) =>
-            (s.title??"").toLowerCase().includes(kw) ||
-            (s.ticker??"").toLowerCase().includes(kw)
-          )
-          .slice(0,20)
-          .map((s: any) => ({ ticker:s.ticker, title:s.title }));
-        return { content:[{ type:"text", text:JSON.stringify({ keyword, results:hits }) }] };
-      }
-    );
   }
 }
 
@@ -358,6 +360,6 @@ export default {
       return MyMCP.serveSSE("/sse").fetch(request, env, ctx);
     if (url.pathname === "/mcp")
       return MyMCP.serve("/mcp").fetch(request, env, ctx);
-    return new Response("Kalshi Sports Connector v10.0", { status:200 });
+    return new Response("Kalshi Sports Connector v11.0", { status:200 });
   },
 };
