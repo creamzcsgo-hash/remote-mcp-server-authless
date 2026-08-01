@@ -95,22 +95,30 @@ async function fetchSeries(ticker: string): Promise<any[]> {
     const d = await pub(`/markets?series_ticker=${ticker}&limit=500`);
     const rows: any[] = [];
     for (const m of d.markets ?? []) {
-      if (m.status !== "active") continue;
+      // Accept any market with valid prices — don't filter by status
+      // since Kalshi uses different status values across market types
       const yb = toCents(m.yes_bid_dollars);
       const ya = toCents(m.yes_ask_dollars);
       const nb = toCents(m.no_bid_dollars);
       if (yb === 0 && ya === 0 && nb === 0) continue;
+      // Skip settled/closed markets
+      const s = (m.status ?? "").toLowerCase();
+      if (s === "settled" || s === "finalized" || s === "determined") continue;
       rows.push({
         s: ticker,
         et: m.event_ticker ?? ticker,
         mt: m.ticker,
         t: (m.yes_sub_title ?? m.title ?? "").slice(0,70),
         yb, ya, nb,
+        status: m.status,
         vol: Math.round(parseFloat(String(m.volume_fp ?? m.volume ?? 0))),
       });
     }
     return rows;
-  } catch { return []; }
+  } catch (e: any) {
+    // Return error info instead of silently returning empty
+    return [{ error: e.message, series: ticker }];
+  }
 }
 
 // ── Agent ─────────────────────────────────────────────────────────────────────
@@ -156,7 +164,11 @@ export class MyMCP extends McpAgent<Env> {
         };
 
         return { content:[{ type:"text", text:JSON.stringify(
-          Object.keys(out).length > 0 ? out : { note:"No active markets found yet." }
+          Object.keys(out).length > 0 ? out : {
+            note:"No markets found.",
+            errors: [...Object.values(mlbByGame).flat(), ...Object.values(nbaByGame).flat()]
+              .filter((r: any) => r.error)
+          }
         ) }] };
       }
     );
