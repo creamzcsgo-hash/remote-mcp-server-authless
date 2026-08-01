@@ -95,9 +95,14 @@ async function fetchSeries(ticker: string, dateFilter?: string): Promise<Record<
       for (const m of markets) {
         const et: string = m.event_ticker ?? "";
         if (dateFilter && !et.includes(dateFilter.toUpperCase())) continue;
+        // Skip any market that is closed/finalized
+        const mStatus = (m.status ?? "").toLowerCase();
+        if (mStatus === "finalized" || mStatus === "settled" || mStatus === "determined" || mStatus === "closed") continue;
         const yb = toCents(m.yes_bid_dollars);
         const ya = toCents(m.yes_ask_dollars);
         const nb = toCents(m.no_bid_dollars);
+        const status = (m.status ?? "").toLowerCase();
+        if (status === "finalized" || status === "settled" || status === "determined") continue;
         if (yb === 0 && ya === 0 && nb === 0) continue;
         if (!byGame[et]) byGame[et] = [];
         byGame[et].push({
