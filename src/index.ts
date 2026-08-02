@@ -108,11 +108,12 @@ async function getEventTickers(ticker: string, date: string): Promise<string[]> 
     let cursor = "";
     for (let page = 0; page < 5; page++) {
       const cp = cursor ? `&cursor=${cursor}` : "";
-      const d = await pub(`/events?series_ticker=${ticker}&status=open${cp}`);
+      // No status filter — games in progress move from "open" to "active"
+      // so filtering by status=open misses live games
+      const d = await pub(`/events?series_ticker=${ticker}${cp}`);
       for (const ev of d.events ?? []) {
-        if ((ev.event_ticker ?? "").includes(dateUpper)) {
-          tickers.push(ev.event_ticker);
-        }
+        const et = ev.event_ticker ?? "";
+        if (et.includes(dateUpper)) tickers.push(et);
       }
       cursor = d.cursor ?? "";
       if (!cursor || (d.events ?? []).length === 0) break;
