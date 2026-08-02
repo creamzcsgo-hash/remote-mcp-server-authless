@@ -100,43 +100,46 @@ function cents(s: string | undefined): number {
 
 const delay = (ms: number) => new Promise(r => setTimeout(r, ms));
 
-// ── Core fetch — one call per series, filter by date + skip dead markets ──────
-
-async function fetchSeries(
-  ticker: string, date: string
-): Promise<Record<string, any[]>> {
-  const byGame: Record<string, any[]> = {};
+// Step 1: get all event tickers for a series + date (no nested markets needed)
+async function getEventTickers(ticker: string, date: string): Promise<string[]> {
+  const tickers: string[] = [];
   const dateUpper = date.toUpperCase();
   try {
     let cursor = "";
-    for (let page = 0; page < 3; page++) {
+    for (let page = 0; page < 5; page++) {
       const cp = cursor ? `&cursor=${cursor}` : "";
-      const d = await pub(`/markets?series_ticker=${ticker}&limit=1000${cp}`);
-      for (const m of d.markets ?? []) {
-        const et: string = m.event_ticker ?? "";
-        // Date filter — only include markets for the requested date
-        if (!et.includes(dateUpper)) continue;
-        // Skip settled/finalized markets
-        if (DEAD_STATUSES.has((m.status ?? "").toLowerCase())) continue;
-        const yb = cents(m.yes_bid_dollars);
-        const ya = cents(m.yes_ask_dollars);
-        const nb = cents(m.no_bid_dollars);
-        // Skip if no price at all
-        if (yb === 0 && ya === 0 && nb === 0) continue;
-        (byGame[et] ??= []).push({
-          s: ticker, et, mt: m.ticker,
-          t: (m.yes_sub_title ?? m.title ?? "").slice(0, 70),
-          yb, ya, nb,
-          status: m.status,
-          vol: Math.round(parseFloat(String(m.volume_fp ?? m.open_interest_fp ?? 0))),
-        });
+      const d = await pub(`/events?series_ticker=${ticker}&status=open${cp}`);
+      for (const ev of d.events ?? []) {
+        if ((ev.event_ticker ?? "").includes(dateUpper)) {
+          tickers.push(ev.event_ticker);
+        }
       }
       cursor = d.cursor ?? "";
-      if (!cursor || d.markets.length < 1000) break;
-      await delay(300);
+      if (!cursor || (d.events ?? []).length === 0) break;
     }
-  } catch { /* skip failed series */ }
-  return byGame;
+  } catch { /* skip */ }
+  return tickers;
+}
+
+// Step 2: fetch all markets for one event directly (always works)
+async function getEventMarkets(eventTicker: string, seriesTicker: string): Promise<any[]> {
+  const markets: any[] = [];
+  try {
+    const d = await pub(`/events/${eventTicker}?with_nested_markets=true`);
+    for (const m of (d.event ?? d).markets ?? []) {
+      if (DEAD_STATUSES.has((m.status ?? "").toLowerCase())) continue;
+      const yb = cents(m.yes_bid_dollars);
+      const ya = cents(m.yes_ask_dollars);
+      const nb = cents(m.no_bid_dollars);
+      markets.push({
+        s: seriesTicker, et: eventTicker, mt: m.ticker,
+        t: (m.yes_sub_title ?? m.title ?? "").slice(0, 70),
+        yb, ya, nb, status: m.status,
+        vol: Math.round(parseFloat(String(m.volume_fp ?? m.open_interest_fp ?? 0))),
+      });
+    }
+  } catch { /* skip */ }
+  return markets;
 }
 
 // ── Agent ─────────────────────────────────────────────────────────────────────
@@ -148,31 +151,34 @@ export class MyMCP extends McpAgent<Env> {
 
   async init() {
 
-    // PRIMARY — get all MLB + NBA markets for a specific date
     this.server.tool(
       "kalshi_get_all_today",
-      "PRIMARY TOOL. Gets all open Kalshi markets for MLB and NBA for a specific date — moneyline, spread/margin, totals, F5 total, and all player props (HR, Ks, hits, HRR, total bases, outs, RBI, SB). Pass date as YYMONDD e.g. '26AUG01' for Aug 1. Returns live markets grouped by game. Fields: mt=market_ticker, et=event_ticker, s=series, t=title, yb=yes_bid(0-100), ya=yes_ask, nb=no_bid, vol=volume. Multiplier = 100/yb.",
-      { date: z.string().describe("Date in YYMONDD format e.g. 26AUG01") },
+      "PRIMARY TOOL. Gets all open Kalshi markets for MLB and NBA for a specific date — moneyline, spread/margin, totals, F5 total, and all player props (HR, Ks, hits, HRR, total bases, outs, RBI, SB). Pass date as YYMONDD e.g. '26AUG02'. Returns live markets grouped by game with real prices. Fields: mt=market_ticker, et=event_ticker, s=series, t=title, yb=yes_bid(0-100), ya=yes_ask, nb=no_bid, vol=volume. Multiplier = 100/yb.",
+      { date: z.string().describe("Date in YYMONDD format e.g. 26AUG02") },
       async ({ date }) => {
         const mlb: Record<string, any[]> = {};
         const nba: Record<string, any[]> = {};
 
-        // Fetch MLB series sequentially with 500ms gaps to stay within rate limits
         for (const ticker of MLB_SERIES) {
-          const games = await fetchSeries(ticker, date);
-          for (const [et, markets] of Object.entries(games)) {
-            (mlb[et] ??= []).push(...markets);
+          // Get event tickers for this series + date
+          const eventTickers = await getEventTickers(ticker, date);
+          await delay(300);
+          // Fetch each event directly
+          for (const et of eventTickers) {
+            const markets = await getEventMarkets(et, ticker);
+            if (markets.length > 0) (mlb[et] ??= []).push(...markets);
+            await delay(200);
           }
-          await delay(500);
         }
 
-        // Fetch NBA series
         for (const ticker of NBA_SERIES) {
-          const games = await fetchSeries(ticker, date);
-          for (const [et, markets] of Object.entries(games)) {
-            (nba[et] ??= []).push(...markets);
+          const eventTickers = await getEventTickers(ticker, date);
+          await delay(300);
+          for (const et of eventTickers) {
+            const markets = await getEventMarkets(et, ticker);
+            if (markets.length > 0) (nba[et] ??= []).push(...markets);
+            await delay(200);
           }
-          await delay(500);
         }
 
         const out: Record<string, any> = {};
@@ -199,7 +205,7 @@ export class MyMCP extends McpAgent<Env> {
             text: JSON.stringify(
               Object.keys(out).length > 0
                 ? out
-                : { note: `No open markets found for ${date}. Markets may not be posted yet — try again closer to game time.` }
+                : { note: `No open markets found for ${date}.` }
             ),
           }],
         };
