@@ -120,7 +120,7 @@ async function fetchGameSeries(
 }
 
 // Strategy B: /events?series_ticker=X then /events/{et}?with_nested_markets=true
-// Works for PROP markets (HR, Ks, hits, HRR, total bases, outs, RBI, SB)
+// Works for PROP markets (HR, Ks, hits, HRR, total bases, outs, RBI, SB) 
 // Confirmed working for KXMLBKS
 async function fetchPropSeries(
   ticker: string, date: string
