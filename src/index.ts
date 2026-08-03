@@ -86,37 +86,8 @@ const delay = (ms: number) => new Promise(r => setTimeout(r, ms));
 // Strategy A: /markets?series_ticker=X
 // Works for FUTURE game markets (ML, spread, total)
 // Confirmed working in browser for KXMLBGAME, KXMLBSPREAD, KXMLBTOTAL
-async function fetchGameSeries(
-  ticker: string, date: string
-): Promise<Record<string, any[]>> {
-  const byGame: Record<string, any[]> = {};
-  const dateUpper = date.toUpperCase();
-  try {
-    let cursor = "";
-    for (let page = 0; page < 5; page++) {
-      const cp = cursor ? `&cursor=${cursor}` : "";
-      const d = await pub(`/markets?series_ticker=${ticker}&limit=1000${cp}`);
-      for (const m of d.markets ?? []) {
-        const et: string = m.event_ticker ?? "";
-        if (!et.includes(dateUpper)) continue;
-        if (DEAD.has((m.status ?? "").toLowerCase())) continue;
-        const yb = cents(m.yes_bid_dollars);
-        const ya = cents(m.yes_ask_dollars);
-        const nb = cents(m.no_bid_dollars);
-        if (yb === 0 && ya === 0 && nb === 0) continue;
-        (byGame[et] ??= []).push({
-          s: ticker, et, mt: m.ticker,
-          t: (m.yes_sub_title ?? m.title ?? "").slice(0, 70),
-          yb, ya, nb, status: m.status,
-          vol: Math.round(parseFloat(String(m.volume_fp ?? m.open_interest_fp ?? 0))),
-        });
-      }
-      cursor = d.cursor ?? "";
-      if (!cursor || (d.markets ?? []).length < 1000) break;
-      await delay(300);
-    }
-  } catch { /* skip */ }
-  return byGame;
+async function fetchGameSeries(ticker: string, date: string): Promise<Record<string, any[]>> {
+  return fetchPropSeries(ticker, date);
 }
 
 // Strategy B: /events?series_ticker=X then /events/{et}?with_nested_markets=true
